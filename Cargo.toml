@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = ["."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+# Single source of truth for dependency versions. Future crates split out of
+# `src/` (storage, builder, network, monitor) inherit them with
+# `dep = { workspace = true }`.
+#
+# Solana crates are pinned to a mutually compatible generation:
+#   solana-client 4.3 -> solana-keypair ^3.1, solana-pubkey ^4.3, solana-commitment-config ^3.1
+#   solana-sdk    4.1 -> solana-keypair ^3.0, solana-pubkey ^4.3
+# (solana-sdk 5.x / solana-keypair 4.x are NOT compatible with solana-client 4.3.)
+[workspace.dependencies]
+# Async runtime (used from Phase 2 onwards).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
+
+# Solana.
+solana-sdk = "4.1"
+solana-client = "4.3"
+solana-keypair = "3.1"
+solana-pubkey = "4.3"
+solana-commitment-config = "3.1"
+
+# Memory safety and errors.
+zeroize = { version = "1.8", features = ["derive"] }
+thiserror = "2"
+
+# Serialization and environment.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+bs58 = "0.5"
+
+# HTTP (rustls only: no OpenSSL / system TLS dependency, friendly to Windows builds).
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+
+# Observability.
+tracing = "0.1"
+tracing-appender = "0.2"
+
+[package]
+name = "krypton"
+description = "Krypton - Solana Atomic Launcher & Liquidity Engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-keypair = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-commitment-config = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+bs58 = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# `panic = "abort"` is intentionally NOT set: with unwinding, destructors still run
+# during a panic, so `ZeroizeOnDrop` secrets are wiped on that path as well.
