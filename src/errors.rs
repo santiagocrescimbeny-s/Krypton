@@ -42,6 +42,11 @@ pub enum LauncherError {
     #[error("IPFS error: {0}")]
     Ipfs(#[from] IpfsError),
 
+    /// On-chain transaction construction failure (PDA derivation, instruction
+    /// encoding, message compilation, signing).
+    #[error("transaction builder error: {0}")]
+    Builder(#[from] BuilderError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -301,4 +306,123 @@ pub fn sanitize_remote_message(raw: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     joined.chars().take(MAX_REMOTE_MESSAGE_CHARS).collect()
+}
+
+/// Failures while deriving addresses, encoding instructions, or assembling and
+/// signing the atomic `Create` + `Buy` transaction.
+///
+/// Variants carry only static labels and numbers (never keys, seeds or remote
+/// text), so they are always safe to log.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BuilderError {
+    /// No valid bump exists for the requested seeds (practically unreachable,
+    /// but reported instead of panicking).
+    #[error("could not derive the program address for `{account}`")]
+    PdaDerivationFailed {
+        /// Logical name of the account being derived.
+        account: &'static str,
+    },
+
+    /// A token metadata field (`name`, `symbol`, `uri`) is empty.
+    #[error("token field `{field}` must not be empty")]
+    EmptyField {
+        /// Offending field.
+        field: &'static str,
+    },
+
+    /// A token metadata field exceeds the on-chain limit.
+    #[error("token field `{field}` is too long: {actual} bytes (max {max})")]
+    FieldTooLong {
+        /// Offending field.
+        field: &'static str,
+        /// Maximum accepted length in bytes.
+        max: usize,
+        /// Actual length in bytes.
+        actual: usize,
+    },
+
+    /// A token metadata field contains a character that would be rejected
+    /// downstream (control characters).
+    #[error("token field `{field}` contains control characters")]
+    InvalidFieldContent {
+        /// Offending field.
+        field: &'static str,
+    },
+
+    /// The requested launch option is not supported by the selected variant.
+    #[error("unsupported launch option: {reason}")]
+    UnsupportedOption {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The initial buy resolves to zero tokens.
+    #[error("the initial buy amount resolves to zero tokens")]
+    ZeroBuyAmount,
+
+    /// The requested tokens exceed what the bonding curve can still sell.
+    #[error("requested {requested} base units but the curve only has {available} left")]
+    BuyExceedsReserves {
+        /// Tokens requested, in base units.
+        requested: u64,
+        /// Tokens still available on the curve, in base units.
+        available: u64,
+    },
+
+    /// Slippage tolerance outside `0..=max`.
+    #[error("slippage {bps} bps exceeds the allowed maximum of {max} bps")]
+    InvalidSlippage {
+        /// Requested slippage.
+        bps: u16,
+        /// Maximum accepted slippage.
+        max: u16,
+    },
+
+    /// Assumed total trading fee outside `0..=max`.
+    #[error("fee {bps} bps exceeds the allowed maximum of {max} bps")]
+    InvalidFee {
+        /// Requested fee.
+        bps: u16,
+        /// Maximum accepted fee.
+        max: u16,
+    },
+
+    /// Curve parameters are inconsistent (zero reserves, supply mismatch, ...).
+    #[error("invalid bonding curve parameters: {reason}")]
+    InvalidCurve {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// A checked arithmetic operation overflowed.
+    #[error("arithmetic overflow while computing {context}")]
+    ArithmeticOverflow {
+        /// What was being computed.
+        context: &'static str,
+    },
+
+    /// The `v0` message could not be compiled.
+    #[error("failed to compile the v0 message: {0}")]
+    MessageCompile(String),
+
+    /// The signed transaction would not fit in a single packet.
+    #[error("transaction is {size} bytes, above the {max} byte packet limit")]
+    TransactionTooLarge {
+        /// Estimated serialized size.
+        size: usize,
+        /// Packet limit.
+        max: usize,
+    },
+
+    /// The supplied wallet does not match the fee payer of the message.
+    #[error("the wallet does not match the transaction fee payer")]
+    PayerMismatch,
+
+    /// The supplied mint signer does not match the mint of the launch.
+    #[error("the mint signer does not match the launch mint")]
+    MintSignerMismatch,
+
+    /// Signing the message failed.
+    #[error("failed to sign the transaction: {0}")]
+    Signing(String),
 }

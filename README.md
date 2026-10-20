@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fase 1 completada**; **Fase 2** (metadatos IPFS/Pinata) implementada, pendiente de verificación local. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1 y 2 completadas**; **Fase 3** (constructor atómico Create + Buy) en curso en la rama `phase3-atomic-builder`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
