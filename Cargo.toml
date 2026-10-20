@@ -51,6 +51,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+# Minimum supported Rust version; keep in sync with rust-toolchain.toml.
+rust-version = "1.97.1"
 
 [dependencies]
 tokio = { workspace = true }

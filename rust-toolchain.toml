@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned for reproducible builds: ~30 `solana-*@4.3.x` crates require rustc >= 1.97.1.
+# Keep in sync with `rust-version` in Cargo.toml.
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
