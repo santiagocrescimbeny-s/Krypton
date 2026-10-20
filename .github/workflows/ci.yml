@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: jobs only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: fmt / check / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The channel is pinned in `rust-toolchain.toml` (1.97.1); rustup honours it,
+      # this step only makes sure the toolchain and components are installed.
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check
+        run: cargo check --all-targets --locked
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails the job on any known advisory in Cargo.lock. To accept a reviewed,
+      # unavoidable transitive advisory, list its id in `.cargo/audit.toml`
+      # (`[advisories] ignore = ["RUSTSEC-..."]`) together with the reason.
+      - name: Audit dependencies
+        run: cargo audit
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: secrets removed from the tree can still live in old commits.
+          fetch-depth: 0
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

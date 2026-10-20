@@ -24,8 +24,9 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
+use bytes::Bytes;
 use reqwest::multipart::{Form, Part};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Body, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -183,9 +184,14 @@ impl ImageFormat {
 }
 
 /// A validated, in-memory token image.
+///
+/// The pixels are held as reference-counted [`Bytes`], so cloning an
+/// `ImageAsset` (or taking [`ImageAsset::shared_bytes`]) is O(1) and never
+/// copies the payload. The uploader relies on this to resend the same image on
+/// every retry attempt without allocating up to 5 MiB each time.
 #[derive(Clone)]
 pub struct ImageAsset {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     format: ImageFormat,
 }
 
@@ -207,6 +213,16 @@ impl ImageAsset {
     /// [`IpfsError::EmptyImage`], [`IpfsError::ImageTooLarge`] or
     /// [`IpfsError::UnsupportedImageFormat`].
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, IpfsError> {
+        // `Bytes::from(Vec<u8>)` takes over the allocation: no copy.
+        Self::from_shared(Bytes::from(bytes))
+    }
+
+    /// Same validation as [`ImageAsset::from_bytes`] for bytes that are already
+    /// reference counted (no copy is made).
+    ///
+    /// # Errors
+    /// See [`ImageAsset::from_bytes`].
+    pub fn from_shared(bytes: Bytes) -> Result<Self, IpfsError> {
         if bytes.is_empty() {
             return Err(IpfsError::EmptyImage);
         }
@@ -265,6 +281,13 @@ impl ImageAsset {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// A shared handle to the image bytes. O(1): only a reference count is
+    /// incremented, the payload is not copied.
+    #[must_use]
+    pub fn shared_bytes(&self) -> Bytes {
+        self.bytes.clone()
     }
 }
 
@@ -736,10 +759,14 @@ fn parse_endpoint(
 // =================================================================================
 
 /// One file to pin.
-struct FilePayload<'a> {
+///
+/// The content is a [`Bytes`] handle: cloning it for each retry attempt is O(1)
+/// (a reference-count bump), so a 5 MiB image is allocated once per upload, not
+/// once per attempt.
+struct FilePayload {
     file_name: String,
     mime: &'static str,
-    bytes: &'a [u8],
+    bytes: Bytes,
 }
 
 #[derive(Deserialize)]
@@ -872,7 +899,7 @@ impl MetadataUploader {
                 image.format().extension()
             ),
             mime: image.format().mime(),
-            bytes: image.as_bytes(),
+            bytes: image.shared_bytes(),
         };
         self.upload_file(&payload).await
     }
@@ -891,13 +918,34 @@ impl MetadataUploader {
         let payload = FilePayload {
             file_name: format!("{}-metadata.json", sanitize_stem(name_stem)),
             mime: "application/json",
-            bytes: &json,
+            bytes: Bytes::from(json),
         };
         self.upload_file(&payload).await
     }
 
     /// Upload with exponential-backoff retries for transient failures.
-    async fn upload_file(&self, file: &FilePayload<'_>) -> Result<IpfsCid, IpfsError> {
+    ///
+    /// # Retry semantics (not idempotent on the Pinata side)
+    /// Retrying is *safe for the result* but *not free of side effects*. A
+    /// timeout, a dropped connection or a `5xx` can happen **after** Pinata has
+    /// already received and pinned the file; the client simply never learns it.
+    /// Resending then creates a second pin record for the same content. This
+    /// costs storage quota / pin slots, never funds, and never changes the
+    /// outcome: IPFS CIDs are content-addressed, so every successful attempt for
+    /// the same bytes returns the **same CID**, and the token's `metadata_uri` is
+    /// identical whether it took one attempt or five.
+    ///
+    /// Mitigations in place: the file name is derived deterministically from the
+    /// (sanitized) token symbol, so duplicate pins are easy to spot and
+    /// de-duplicate by CID in the Pinata dashboard / API; the retry budget is
+    /// small and capped ([`MAX_RETRIES_CAP`]); permanent errors (`401`, `403`,
+    /// other `4xx`, malformed responses) are never retried. Callers that need
+    /// strict at-most-once pinning should set the retry count to `0` and
+    /// de-duplicate by CID themselves.
+    ///
+    /// The payload is a shared [`Bytes`] handle, so each attempt re-sends the
+    /// same buffer without copying it.
+    async fn upload_file(&self, file: &FilePayload) -> Result<IpfsCid, IpfsError> {
         let max_attempts = self.config.max_retries.saturating_add(1);
         let mut attempt: u32 = 0;
         loop {
@@ -936,7 +984,7 @@ impl MetadataUploader {
             .min(MAX_BACKOFF)
     }
 
-    async fn attempt_upload(&self, file: &FilePayload<'_>) -> Result<IpfsCid, IpfsError> {
+    async fn attempt_upload(&self, file: &FilePayload) -> Result<IpfsCid, IpfsError> {
         let form = build_form(file)?;
         let response = self
             .client
@@ -978,8 +1026,12 @@ fn sanitize_stem(raw: &str) -> String {
     }
 }
 
-fn build_form(file: &FilePayload<'_>) -> Result<Form, IpfsError> {
-    let part = Part::bytes(file.bytes.to_vec())
+fn build_form(file: &FilePayload) -> Result<Form, IpfsError> {
+    // `Bytes::clone` is O(1): the buffer is shared, not copied, on every attempt.
+    // The length is declared explicitly so the multipart body keeps a known
+    // `Content-Length` (a bare `Part::stream` would force chunked encoding).
+    let length = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
+    let part = Part::stream_with_length(Body::from(file.bytes.clone()), length)
         .file_name(file.file_name.clone())
         .mime_str(file.mime)
         .map_err(|err| IpfsError::Transport(err.without_url()))?;

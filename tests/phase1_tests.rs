@@ -726,3 +726,26 @@ fn question_mark_converts_config_errors_into_the_crate_result() {
         Err(LauncherError::Config(ConfigError::MissingVar { .. }))
     ));
 }
+
+// =================================================================================
+// Audit findings #1 / #11: the config keeps a parsed wallet, not the key text
+// =================================================================================
+
+#[test]
+fn config_exposes_the_parsed_wallet_without_the_key_text() -> TestResult {
+    let key = base58_of(&keypair_bytes(7));
+    let config = Config::from_vars(minimal_vars())?;
+
+    // The borrowed wallet and a freshly built copy describe the same key.
+    let expected = keypair_bytes(7);
+    let expected_public = expected.last_chunk::<PUBLIC_KEY_BYTES>().ok_or("short")?;
+    assert_eq!(&config.wallet().pubkey_bytes(), expected_public);
+    assert_eq!(&config.load_wallet()?.pubkey_bytes(), expected_public);
+    assert_eq!(config.wallet().pubkey(), config.load_wallet()?.pubkey());
+
+    // Nothing printable carries the key.
+    let rendered = format!("{config:?}");
+    assert!(!rendered.contains(&key));
+    assert!(rendered.contains("<redacted>"));
+    Ok(())
+}

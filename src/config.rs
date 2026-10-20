@@ -5,6 +5,19 @@
 //! [`Config`]. Every value is range/format checked; nothing is silently
 //! clamped, and no error message ever contains a secret or a URL.
 //!
+//! # Secrets
+//! The wallet key is parsed once, during validation, into a zeroizing
+//! [`SecureWallet`]; the original string ([`SecretString`]) is wiped as soon as
+//! parsing finishes, so [`Config`] never retains the textual key. In addition,
+//! [`Config::from_env`] removes `PRIVATE_KEY` from the process environment right
+//! after reading it.
+//!
+//! # `.env` discovery
+//! Only an explicit path is ever read ([`DEFAULT_DOTENV_PATH`] for
+//! [`Config::from_env`], or the path given to [`Config::from_env_file`]). Parent
+//! directories are never searched, so a stray `.env` in an untrusted ancestor
+//! directory cannot inject configuration.
+//!
 //! Parsing is separated from the process environment: [`Config::from_vars`]
 //! takes an explicit map, which keeps it deterministic and testable without
 //! mutating global state. [`Config::from_env`] is the thin production wrapper.
@@ -12,7 +25,7 @@
 use std::collections::HashMap;
 use std::env::VarError;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use reqwest::Url;
@@ -91,6 +104,10 @@ pub const DEFAULT_JITO_TIP_LAMPORTS: u64 = 100_000;
 pub const MIN_JITO_TIP_LAMPORTS: u64 = 1_000;
 /// Default log directory.
 pub const DEFAULT_LOG_DIR: &str = "logs";
+/// Default `.env` file: a fixed path relative to the working directory (the
+/// repository root when launched from it). Never searched for in parent
+/// directories.
+pub const DEFAULT_DOTENV_PATH: &str = ".env";
 /// Default log level.
 pub const DEFAULT_LOG_LEVEL: tracing::Level = tracing::Level::INFO;
 
@@ -120,7 +137,7 @@ struct RawConfig {
 
 /// Validated runtime configuration.
 ///
-/// Intentionally not `Clone` (it owns the wallet secret); share it behind an
+/// Intentionally not `Clone` (it owns the parsed wallet); share it behind an
 /// `Arc`. `Debug` redacts the secret and strips paths/queries from URLs.
 pub struct Config {
     /// Solana JSON-RPC endpoint (`http`/`https`).
@@ -149,36 +166,52 @@ pub struct Config {
     pub log_dir: PathBuf,
     /// Minimum level to log.
     pub log_level: tracing::Level,
-    private_key: SecretString,
+    /// The parsed wallet. The textual key is not kept (see the module docs).
+    wallet: SecureWallet,
 }
 
 impl Config {
-    /// Loads `.env` (if present) and the process environment, then validates.
+    /// Loads [`DEFAULT_DOTENV_PATH`] (if present) and the process environment,
+    /// then validates.
     ///
-    /// A missing `.env` is fine; a malformed one is an error (reported without
-    /// echoing its contents).
+    /// Equivalent to [`Config::from_env_file`] with the default path. Call it
+    /// once at startup, **before spawning threads** (see the note there).
     ///
     /// # Errors
     /// Any [`ConfigError`].
     pub fn from_env() -> Result<Self, ConfigError> {
-        load_dotenv()?;
+        Self::from_env_file(Path::new(DEFAULT_DOTENV_PATH))
+    }
 
-        let mut vars = HashMap::with_capacity(ENV_KEYS.len());
-        for key in ENV_KEYS {
-            match std::env::var(key) {
-                Ok(value) => {
-                    vars.insert(key.to_owned(), value);
-                }
-                Err(VarError::NotPresent) => {}
-                Err(VarError::NotUnicode(_)) => {
-                    return Err(ConfigError::InvalidVar {
-                        name: key,
-                        reason: "value is not valid UTF-8".to_owned(),
-                    });
-                }
-            }
-        }
-        Self::from_vars(vars)
+    /// Loads the `.env` file at exactly `dotenv_path` (if it exists) and the
+    /// process environment, then validates.
+    ///
+    /// - A missing file is fine; a malformed one is an error (reported without
+    ///   echoing its contents).
+    /// - No directory search is performed: only `dotenv_path` is read. Values
+    ///   already present in the process environment win over the file.
+    /// - `PRIVATE_KEY` is removed from the process environment as soon as it has
+    ///   been read, whether or not validation succeeds, so child processes and
+    ///   later `std::env::vars()` calls cannot see it.
+    ///
+    /// # Limits
+    /// `std::env::remove_var` is only sound while no other thread reads or
+    /// writes the environment, so call this during single-threaded startup.
+    /// It cannot wipe the OS-level copy of the initial environment block (for
+    /// example `/proc/<pid>/environ` on Linux), nor the `String` returned by
+    /// `std::env::var`, which is moved into the config and zeroized there.
+    /// Prefer a secret store or a restricted-permission `.env` over exporting
+    /// the key in the shell.
+    ///
+    /// # Errors
+    /// Any [`ConfigError`].
+    pub fn from_env_file(dotenv_path: &Path) -> Result<Self, ConfigError> {
+        // `dotenvy` applies a file line by line, so a syntax error half-way
+        // through can leave `PRIVATE_KEY` already exported. Scrub regardless of
+        // the outcome, before any validation can fail or log.
+        let snapshot = load_dotenv(dotenv_path).and_then(|()| collect_env_vars());
+        scrub_secret_env();
+        Self::from_vars(snapshot?)
     }
 
     /// Builds a validated configuration from an explicit variable map.
@@ -214,10 +247,13 @@ impl Config {
         let creator_sol = require(ENV_CREATOR_SOL_AMOUNT, clean(raw.creator_sol_amount))?;
 
         // Fail fast on a malformed key instead of at first signature. The wallet
-        // built here is dropped (and therefore wiped) immediately; `WalletError`
-        // messages never contain key material, so forwarding them is safe.
-        SecureWallet::from_secret_str(private_key.expose_secret())
+        // built here is kept (it zeroizes itself); `WalletError` messages never
+        // contain key material, so forwarding them is safe.
+        let wallet = SecureWallet::from_secret_str(private_key.expose_secret())
             .map_err(|err| invalid(ENV_PRIVATE_KEY, &err.to_string()))?;
+        // The textual key is no longer needed: wipe it now instead of keeping it
+        // for the lifetime of the config (the parsed `wallet` zeroizes itself).
+        drop(private_key);
 
         let creator_buy_lamports = parse_sol_to_lamports(&creator_sol)
             .map_err(|reason| invalid(ENV_CREATOR_SOL_AMOUNT, reason))?;
@@ -307,16 +343,25 @@ impl Config {
             log_dir: clean(raw.log_dir)
                 .map_or_else(|| PathBuf::from(DEFAULT_LOG_DIR), PathBuf::from),
             log_level,
-            private_key,
+            wallet,
         })
     }
 
-    /// Parses the configured `PRIVATE_KEY` into a zeroizing [`SecureWallet`].
+    /// Borrows the configured wallet.
+    #[must_use]
+    pub fn wallet(&self) -> &SecureWallet {
+        &self.wallet
+    }
+
+    /// Builds an independent [`SecureWallet`] from the configured key.
+    ///
+    /// The copy is made from the already-validated raw bytes (the original
+    /// string is long gone), and it zeroizes itself when dropped.
     ///
     /// # Errors
     /// Any [`WalletError`]; none of them contains key material.
     pub fn load_wallet(&self) -> Result<SecureWallet, WalletError> {
-        SecureWallet::from_secret_str(self.private_key.expose_secret())
+        SecureWallet::from_keypair_bytes(self.wallet.secret().expose())
     }
 }
 
@@ -357,12 +402,38 @@ pub fn redact_url(url: &Url) -> String {
 
 // --- Helpers -------------------------------------------------------------------
 
-fn load_dotenv() -> Result<(), ConfigError> {
-    match dotenvy::dotenv() {
-        Ok(_) => Ok(()),
+/// Reads exactly `path` (no parent-directory search). A missing file is fine.
+fn load_dotenv(path: &Path) -> Result<(), ConfigError> {
+    match dotenvy::from_path(path) {
+        Ok(()) => Ok(()),
         Err(err) if err.not_found() => Ok(()),
         Err(err) => Err(sanitize_dotenv_error(&err)),
     }
+}
+
+/// Snapshots the recognised variables from the process environment.
+fn collect_env_vars() -> Result<HashMap<String, String>, ConfigError> {
+    let mut vars = HashMap::with_capacity(ENV_KEYS.len());
+    for key in ENV_KEYS {
+        match std::env::var(key) {
+            Ok(value) => {
+                vars.insert(key.to_owned(), value);
+            }
+            Err(VarError::NotPresent) => {}
+            Err(VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidVar {
+                    name: key,
+                    reason: "value is not valid UTF-8".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(vars)
+}
+
+/// Removes the wallet key from the process environment.
+fn scrub_secret_env() {
+    std::env::remove_var(ENV_PRIVATE_KEY);
 }
 
 /// Maps a `dotenvy` error to a variant that cannot leak file contents

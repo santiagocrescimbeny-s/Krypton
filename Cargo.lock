@@ -1976,6 +1976,7 @@ name = "krypton"
 version = "0.1.0"
 dependencies = [
  "bs58",
+ "bytes",
  "dotenvy",
  "reqwest",
  "serde",

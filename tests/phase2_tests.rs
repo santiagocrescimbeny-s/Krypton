@@ -13,6 +13,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use common::{MockResponse, MockServer, RecordedRequest};
 use krypton::errors::{
     sanitize_remote_message, ConfigError, IpfsError, LauncherError, MAX_REMOTE_MESSAGE_CHARS,
@@ -902,4 +903,112 @@ fn ipfs_errors_convert_into_the_launcher_error() {
         pipeline(Vec::new()),
         Err(LauncherError::Ipfs(IpfsError::EmptyImage))
     ));
+}
+
+// =================================================================================
+// Shared image buffers (audit finding #15) and retry payloads
+// =================================================================================
+
+#[test]
+fn image_handles_share_one_buffer() -> TestResult {
+    let image = png_image()?;
+    let clone = image.clone();
+    let shared = image.shared_bytes();
+
+    // Same allocation: cloning never copies the pixels.
+    assert_eq!(image.as_bytes().as_ptr(), clone.as_bytes().as_ptr());
+    assert_eq!(image.as_bytes().as_ptr(), shared.as_ptr());
+    assert_eq!(shared.len(), image.len());
+    assert_eq!(&shared[..], image.as_bytes());
+    Ok(())
+}
+
+#[test]
+fn from_shared_validates_like_from_bytes() -> TestResult {
+    let bytes = Bytes::from(png_bytes());
+    let image = ImageAsset::from_shared(bytes.clone())?;
+    assert_eq!(image.as_bytes().as_ptr(), bytes.as_ptr());
+    assert_eq!(image.format(), ImageFormat::Png);
+    assert_eq!(image.len(), bytes.len());
+
+    assert!(matches!(
+        err_of(ImageAsset::from_shared(Bytes::new()))?,
+        IpfsError::EmptyImage
+    ));
+    assert!(matches!(
+        err_of(ImageAsset::from_shared(Bytes::from_static(b"not an image")))?,
+        IpfsError::UnsupportedImageFormat
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_retry_attempt_resends_the_complete_image() -> TestResult {
+    let server = MockServer::start(|index, _| {
+        if index < 2 {
+            MockResponse::json(503, r#"{"error":"try later"}"#)
+        } else {
+            ok_cid(IMAGE_CID)
+        }
+    })?;
+    let uploader = uploader(&server, 3)?;
+    let image = png_image()?;
+
+    let cid = uploader.upload_image(&image, "KRYP").await?;
+    assert_eq!(cid.as_str(), IMAGE_CID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    for (attempt, request) in requests.iter().enumerate() {
+        assert!(
+            request.body_contains(image.as_bytes()),
+            "attempt {attempt} lost image bytes"
+        );
+        assert!(request.body_contains(b"-image.png\""));
+    }
+    // The shared handle is still intact after three sends.
+    assert_eq!(image.as_bytes(), png_bytes().as_slice());
+    Ok(())
+}
+
+#[tokio::test]
+async fn uploads_declare_a_content_length() -> TestResult {
+    let server = MockServer::start(|_, _| ok_cid(IMAGE_CID))?;
+    let uploader = uploader(&server, 0)?;
+    uploader.upload_image(&png_image()?, "KRYP").await?;
+
+    let requests = server.requests();
+    let request = requests.first().ok_or("no request recorded")?;
+    let declared: usize = request
+        .header("content-length")
+        .ok_or("missing Content-Length")?
+        .parse()?;
+    assert_eq!(declared, request.body.len());
+    assert!(request.header("transfer-encoding").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn retried_document_uploads_resend_the_same_json() -> TestResult {
+    let server = MockServer::start(|index, _| {
+        if index == 0 {
+            MockResponse::json(502, "bad gateway")
+        } else {
+            ok_cid(METADATA_CID)
+        }
+    })?;
+    let uploader = uploader(&server, 2)?;
+    let document = MetadataDocument::new(
+        &sample_metadata(),
+        "https://gateway.example/ipfs/img",
+        ImageFormat::Png,
+    );
+
+    uploader.upload_document(&document, "KRYP").await?;
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let first = embedded_json(requests.first().ok_or("missing first request")?)?;
+    let second = embedded_json(requests.get(1).ok_or("missing second request")?)?;
+    assert_eq!(first, second);
+    Ok(())
 }
