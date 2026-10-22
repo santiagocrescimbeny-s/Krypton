@@ -259,6 +259,121 @@ impl BuyPlan {
     }
 }
 
+/// A fully resolved sell on the constant-product curve: how many tokens, and
+/// the SOL floor the program must honour.
+///
+/// Selling `t` tokens returns `floor(vs * t / (vt + t))` lamports before fees.
+/// The fee is rounded **up** and the slippage floor **down**, so every rounding
+/// error works against the seller's estimate and `min_sol_output` is never
+/// optimistic. The slippage tolerance obeys the same hard bound as buys
+/// ([`MAX_SLIPPAGE_BPS`], audit finding #20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SellPlan {
+    /// Tokens to sell (`amount` argument of `sell_v3`), in base units.
+    pub token_amount: u64,
+    /// Expected proceeds before fees, in lamports.
+    pub gross_proceeds_lamports: u64,
+    /// Assumed fee, in lamports (rounded up).
+    pub fee_lamports: u64,
+    /// Expected proceeds after fees, in lamports.
+    pub net_proceeds_lamports: u64,
+    /// Slippage-protected floor (`min_sol_output` argument), in lamports.
+    pub min_sol_output_lamports: u64,
+    /// Assumed fee in basis points used for this plan.
+    pub fee_bps: u16,
+    /// Slippage tolerance in basis points used for this plan.
+    pub slippage_bps: u16,
+}
+
+impl SellPlan {
+    /// Plans a sale of exactly `token_amount` base units against `curve`.
+    ///
+    /// # Errors
+    /// - [`BuilderError::ZeroSellAmount`] for `0`;
+    /// - [`BuilderError::InvalidFee`] / [`BuilderError::InvalidSlippage`] for
+    ///   out-of-range basis points;
+    /// - [`BuilderError::InvalidCurve`] for inconsistent reserves or when the
+    ///   floor rounds down to zero lamports (a zero floor would switch the
+    ///   slippage protection off);
+    /// - [`BuilderError::ArithmeticOverflow`] if an intermediate value overflows.
+    pub fn from_token_amount(
+        curve: &CurveParams,
+        token_amount: u64,
+        fee_bps: u16,
+        slippage_bps: u16,
+    ) -> Result<Self, BuilderError> {
+        curve.validate()?;
+        check_bps(fee_bps, slippage_bps)?;
+        if token_amount == 0 {
+            return Err(BuilderError::ZeroSellAmount);
+        }
+
+        let vs = u128::from(curve.virtual_sol_reserves);
+        let vt = u128::from(curve.virtual_token_reserves);
+        let sold = u128::from(token_amount);
+        let denominator = vt
+            .checked_add(sold)
+            .ok_or(BuilderError::ArithmeticOverflow {
+                context: "sell denominator",
+            })?;
+        let gross = mul_div_floor(vs, sold, denominator, "gross proceeds")?;
+        let fee = mul_div_ceil(gross, u128::from(fee_bps), BPS_DENOMINATOR, "sell fee")?;
+        let net = gross
+            .checked_sub(fee)
+            .ok_or(BuilderError::ArithmeticOverflow {
+                context: "net proceeds",
+            })?;
+        let keep_bps = BPS_DENOMINATOR
+            .checked_sub(u128::from(slippage_bps))
+            .ok_or(BuilderError::ArithmeticOverflow {
+                context: "slippage complement",
+            })?;
+        let floor = mul_div_floor(net, keep_bps, BPS_DENOMINATOR, "slippage floor")?;
+        if floor == 0 {
+            return Err(BuilderError::InvalidCurve {
+                reason: "sell proceeds round down to zero",
+            });
+        }
+
+        Ok(Self {
+            token_amount,
+            gross_proceeds_lamports: to_u64(gross, "gross proceeds")?,
+            fee_lamports: to_u64(fee, "sell fee")?,
+            net_proceeds_lamports: to_u64(net, "net proceeds")?,
+            min_sol_output_lamports: to_u64(floor, "slippage floor")?,
+            fee_bps,
+            slippage_bps,
+        })
+    }
+
+    /// The curve after this sale executes (tokens return to the curve, the
+    /// gross proceeds leave its SOL reserve).
+    ///
+    /// Used to quote follow-up tranches against the impact of those still in
+    /// flight (see the exit engine).
+    ///
+    /// # Errors
+    /// [`BuilderError::ArithmeticOverflow`] if a reserve under- or overflows.
+    pub fn apply_to(&self, curve: &CurveParams) -> Result<CurveParams, BuilderError> {
+        let overflow = |context| BuilderError::ArithmeticOverflow { context };
+        Ok(CurveParams {
+            virtual_token_reserves: curve
+                .virtual_token_reserves
+                .checked_add(self.token_amount)
+                .ok_or_else(|| overflow("projected virtual tokens"))?,
+            virtual_sol_reserves: curve
+                .virtual_sol_reserves
+                .checked_sub(self.gross_proceeds_lamports)
+                .ok_or_else(|| overflow("projected virtual SOL"))?,
+            real_token_reserves: curve
+                .real_token_reserves
+                .checked_add(self.token_amount)
+                .ok_or_else(|| overflow("projected real tokens"))?,
+            token_total_supply: curve.token_total_supply,
+        })
+    }
+}
+
 fn check_bps(fee_bps: u16, slippage_bps: u16) -> Result<(), BuilderError> {
     if fee_bps > MAX_FEE_BPS {
         return Err(BuilderError::InvalidFee {

@@ -8,7 +8,10 @@
 //!
 //! Later phases add [`storage`] (Pinata/IPFS metadata), [`builder`] (atomic
 //! `Create` + `Buy` transaction, lookup tables) and [`network`] (Jito Block
-//! Engine client and tip). [`monitor`] is scaffolding for Phase 5.
+//! Engine client and tip). [`monitor`] (Phase 5) holds the real-time pieces:
+//! the Geyser stream supervisor ([`monitor::geyser`]), bonding-curve decoding
+//! ([`monitor::curve`]), the multi-tranche exit engine ([`monitor::exit`]) and the
+//! Jito-backed sell submitter ([`monitor::submit`]).
 
 #![forbid(unsafe_code)]
 // Zero Panics Policy: enforced by the compiler for all non-test code.

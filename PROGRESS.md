@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-22 · Base: `main` (`68c3d1e`) = Fases 1-3 + correcciones de las auditorías 2026-10-20/21; rama `phase4-jito-engine`
+Última actualización: 2026-10-22 · Base: `main` (`26d4ecf`) = Fases 1-4 + correcciones de las auditorías; rama `phase5-monitor-exit`
 
 ## Hoja de ruta
 
@@ -9,8 +9,8 @@
 | 1 | Arquitectura base, seguridad de memoria y entorno | ✅ **Completada y verificada** |
 | 2 | Motor asíncrono de metadatos (IPFS / Pinata) | ✅ **VERIFICADA** (auditoría 2026-10-20) |
 | 3 | Constructor atómico de transacciones (Create + Buy) | ✅ **COMPLETED & VERIFIED** (auditoría 2026-10-20 run 2; guardas #19/#20/#22 confirmadas por el propietario con 164 tests en `main`) |
-| 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | 🚧 **IN PROGRESS** — rama `phase4-jito-engine`: código y tests escritos, gates de `cargo` pendientes |
-| 5 | Monitor Yellowstone gRPC + gestor de salida | ⬜ Pendiente |
+| 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | ✅ **COMPLETED & VERIFIED** (213 tests en `main` según el propietario; fusionada en `26d4ecf`) |
+| 5 | Monitor Yellowstone gRPC + gestor de salida | 🚧 **IN PROGRESS** — rama `phase5-monitor-exit`: código y tests escritos, gates de `cargo` real pendientes |
 | 6 | Harness de pruebas, `tracing` y dry-run | ⬜ Pendiente |
 
 ## Fase 1 — completada y verificada
@@ -108,9 +108,9 @@ ejecutadas. **No ejecutado**: `cargo check/clippy/test` con las crates reales (c
 Recuento esperado de tests tras la fusión: 6 unitarios + 6 `env_hygiene` + 37 `phase1` + 38 `phase2` + 77 `phase3` = **164**
 (146 de la fusión + 18 de las guardas).
 
-## Fase 4 — Jito Block Engine y ALT (IN PROGRESS)
+## Fase 4 — Jito Block Engine y ALT (COMPLETED & VERIFIED)
 
-Rama `phase4-jito-engine`. Código nuevo: `src/builder/alt.rs`, `src/network/jito.rs`, `JitoError` y
+Fusionada en `main` (`26d4ecf`); el propietario confirma los 213 tests en verde. Rama de origen `phase4-jito-engine`. Código nuevo: `src/builder/alt.rs`, `src/network/jito.rs`, `JitoError` y
 `BuilderError::InvalidLookupTable` en `src/errors.rs`, `tests/phase4_tests.rs` (48 tests).
 
 | Pieza | Contenido |
@@ -142,6 +142,48 @@ Verificación de esta entrega: `rustfmt --check` limpio; `alt.rs` y el builder c
 (base64, tip, `BundleId`, short_vec) compiladas y ejecutadas aparte. **No ejecutado**: `cargo check/clippy/test` con las crates
 reales (crates.io bloqueado en el sandbox), por lo que el cliente HTTP (`reqwest`/`serde`) y `tests/phase4_tests.rs` están sin compilar.
 Recuento esperado: 6 unitarios + 6 `env_hygiene` + 38 `phase1` + 38 `phase2` + 77 `phase3` + 48 `phase4` = **213**.
+
+## Fase 5 — Monitor de flujo y gestor de salida (IN PROGRESS)
+
+Rama `phase5-monitor-exit`. Código nuevo: `src/monitor/{curve,geyser,exit,submit}.rs`, `src/builder/sell.rs`,
+`SellPlan` en `builder/math.rs`, `sell_v3` en `builder/instructions.rs`, variantes `MonitorError` / `ExitError` /
+`StreamErrorKind` / `BuilderError::ZeroSellAmount` en `src/errors.rs`, `tests/phase5_tests.rs` (97 tests),
+`tests/phase5_submit_tests.rs` (10 tests) y `docs/yellowstone-adapter.md`.
+
+| Pieza | Contenido |
+|-------|-----------|
+| `monitor/curve.rs` | Decodificador *zero-copy* de la cuenta `BondingCurve` (discriminador, reservas, `complete`, flags `mayhem`/`cashback`; tolera cuentas antiguas más cortas), `CurveObservation` ordenada por (slot, write_version), `PriceReference`, progreso e índice de precio en bps |
+| `monitor/geyser.rs` | Supervisor del stream sobre dos traits (`StreamTransport` / `EventStream`): reconexión con backoff exponencial y *jitter*, watchdog de inactividad, tiempo máximo de conexión, límite de fallos consecutivos, `HealthStatus` por `watch`, apagado limpio; los datos de cuenta/instrucción viajan como `bytes::Bytes` (sin copias) |
+| `monitor/exit.rs` | `ExitPlan` (2..=8 tramos entre 1 s y 10 s tras el génesis, stop-loss opcional), `ExitEngine` síncrono y determinista (cotiza cada tramo contra la última observación **más** el impacto de las ventas en vuelo; los tramos fallidos o descartados se acumulan en el siguiente; presupuesto de coste), `ExitManager` (orquesta stream, temporizador y reportes con `tokio::select!`), `run_sell_executor` (envíos concurrentes con `JoinSet`) |
+| `monitor/submit.rs` | `JitoSellSubmitter`: `[limit, price, sell_v3, tip]` firmado, `sendBundle` (sin reintento) y sondeo de `getInflightBundleStatuses`; en dry-run el pedido termina como `Simulated` tras firmar |
+| `builder/{math,instructions,sell}.rs` | `SellPlan` (`u128` + `checked_*`; comisión redondeada hacia arriba, mínimo de SOL hacia abajo; slippage ≤ `MAX_SLIPPAGE_BPS` = 10 %, hallazgo #20; mínimo cero rechazado), `sell_v3` (mismas 17 cuentas que `buy_v3`; las monedas con *cashback* rechazan v3), `SellBuilder` con tope del priority fee (#19) |
+
+Decisiones y garantías:
+
+- **Sin `tonic`/`prost` en `Cargo.lock`:** el transporte real de Yellowstone no se puede añadir sin acceso a crates.io, así que la
+  lógica de supervisión vive tras traits y el adaptador queda especificado en `docs/yellowstone-adapter.md`. Los tests usan un
+  transporte guionizado.
+- **Sin bloqueos:** todos los canales son acotados; las órdenes se envían con `try_send` a una cola mayor que el máximo de órdenes
+  posibles (`ORDER_CHANNEL_CAPACITY`); ningún `.await` mantiene un *guard*; el cierre (`ShutdownTrigger`) también se activa al soltar el emisor.
+- **Ventana 1-10 s:** un tramo que llega tarde (más de 500 ms) se descarta (`WindowMissed`) y su cantidad pasa al siguiente.
+- **Stop-loss:** barrido de lo que queda con un máximo de 3 intentos y bajo el presupuesto de costes.
+- **El apagado no liquida** la posición: informa lo no vendido en el resumen.
+- Higiene de memoria: ninguna estructura de la fase guarda claves; el `SecureWallet` se comparte por `Arc` y la firma usa
+  `keypair()` solo durante `sign`.
+- Cero `unwrap`/`expect`/indexación sin comprobar en `src/` (lints `deny` + `#![forbid(unsafe_code)]`).
+
+Verificación de esta entrega (honesta): crates.io está bloqueado en el sandbox, así que **no** se ejecutó `cargo` real. Se montó un
+workspace de prueba con `tokio 1.53.3`, `bytes`, `thiserror 2.0.17` y `tracing` **reales** y *mocks* de las crates de Solana,
+`zeroize`, `reqwest` y `serde_json`: `src/monitor/{curve,geyser,exit}.rs`, `builder/{math,sell}.rs` y los **97 tests de
+`phase5_tests.rs`** compilan y pasan, y `clippy --all-targets -- -D warnings` sale limpio (con los lints `deny` del crate).
+**Sin verificar con las crates reales:** `monitor/submit.rs` y `tests/phase5_submit_tests.rs` (dependen de `reqwest`/`serde`),
+`SellSettings::from_config`, los tamaños reales de `try_compile`, las firmas reales y la función `from_str_const` de `Pubkey`;
+la *feature* `test-util` de tokio como `dev-dependency` (no debería añadir paquetes a `Cargo.lock`, pero hay que confirmarlo con `--locked`).
+
+Recuento esperado tras `cargo test --locked`: 213 (Fases 1-4) + 97 `phase5` + 10 `phase5_submit` = **320**.
+
+Pendiente de la Fase 5: adaptador Yellowstone real (`tonic`), cableado en un `main` con `trigger_on_ctrl_c`, lectura viva del
+saldo de tokens, y las comprobaciones con `cargo` real descritas arriba.
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 

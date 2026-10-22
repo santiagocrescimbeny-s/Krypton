@@ -51,6 +51,14 @@ pub enum LauncherError {
     #[error("Jito error: {0}")]
     Jito(#[from] JitoError),
 
+    /// Real-time stream monitor failure (Geyser connection, account decoding).
+    #[error("monitor error: {0}")]
+    Monitor(#[from] MonitorError),
+
+    /// Exit manager failure (plan validation, sell quoting, order dispatch).
+    #[error("exit error: {0}")]
+    Exit(#[from] ExitError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -500,6 +508,10 @@ pub enum BuilderError {
     #[error("the initial buy amount resolves to zero tokens")]
     ZeroBuyAmount,
 
+    /// A sell of zero tokens was requested.
+    #[error("the sell amount resolves to zero tokens")]
+    ZeroSellAmount,
+
     /// The requested tokens exceed what the bonding curve can still sell.
     #[error("requested {requested} base units but the curve only has {available} left")]
     BuyExceedsReserves {
@@ -591,4 +603,202 @@ pub enum BuilderError {
     /// Signing the message failed.
     #[error("failed to sign the transaction: {0}")]
     Signing(String),
+}
+
+/// Coarse classification of a stream transport failure.
+///
+/// Transport adapters (for example a Yellowstone gRPC client) map their native
+/// status codes onto these kinds, so the error type stays free of remote text
+/// (which could echo endpoints or tokens) and is always safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamErrorKind {
+    /// The endpoint could not be reached (DNS, TCP, refused, reset).
+    Unreachable,
+    /// TLS negotiation failed.
+    Tls,
+    /// The endpoint rejected the credentials (`x-token`). Never retried.
+    Unauthenticated,
+    /// The endpoint refused the subscription request as malformed. Never retried.
+    InvalidRequest,
+    /// The endpoint shed load (`RESOURCE_EXHAUSTED`, `UNAVAILABLE`, rate limit).
+    Overloaded,
+    /// The peer violated the stream protocol or sent undecodable data.
+    Protocol,
+    /// Any other failure.
+    Other,
+}
+
+impl std::fmt::Display for StreamErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Unreachable => "endpoint unreachable",
+            Self::Tls => "TLS failure",
+            Self::Unauthenticated => "authentication rejected",
+            Self::InvalidRequest => "subscription rejected",
+            Self::Overloaded => "endpoint overloaded",
+            Self::Protocol => "protocol violation",
+            Self::Other => "other failure",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Failures of the real-time stream monitor (Phase 5).
+///
+/// Variants carry only static labels and numbers, so they are always safe to log.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MonitorError {
+    /// The transport failed to connect or the stream broke.
+    #[error("stream connection failure: {kind}")]
+    Connection {
+        /// Classification of the failure.
+        kind: StreamErrorKind,
+    },
+
+    /// The server closed the stream cleanly.
+    #[error("the stream was closed by the server")]
+    StreamClosed,
+
+    /// No update (not even a heartbeat) arrived within the idle deadline.
+    #[error("no stream activity for {millis} ms")]
+    IdleTimeout {
+        /// Deadline that was exceeded, in milliseconds.
+        millis: u64,
+    },
+
+    /// Establishing the connection took longer than the allowed deadline.
+    #[error("connecting took longer than {millis} ms")]
+    ConnectTimeout {
+        /// Deadline that was exceeded, in milliseconds.
+        millis: u64,
+    },
+
+    /// The reconnection budget is exhausted.
+    #[error("gave up after {attempts} consecutive failed connection attempts")]
+    ReconnectExhausted {
+        /// Consecutive failures before giving up.
+        attempts: u32,
+    },
+
+    /// An account payload is shorter than the layout requires.
+    #[error("account data is {actual} bytes, at least {min} required")]
+    AccountTooShort {
+        /// Bytes received.
+        actual: usize,
+        /// Minimum bytes the layout needs.
+        min: usize,
+    },
+
+    /// The account does not start with the expected Anchor discriminator.
+    #[error("unexpected account discriminator")]
+    UnexpectedDiscriminator,
+
+    /// A decoded field holds a value no valid account can have.
+    #[error("invalid account data: {reason}")]
+    InvalidAccountData {
+        /// Static, value-free explanation.
+        reason: &'static str,
+    },
+
+    /// Monitor settings are inconsistent.
+    #[error("invalid monitor configuration: {reason}")]
+    InvalidConfig {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The receiving side of an internal channel is gone.
+    #[error("the `{channel}` channel is closed")]
+    ChannelClosed {
+        /// Logical name of the channel.
+        channel: &'static str,
+    },
+}
+
+impl MonitorError {
+    /// Whether reconnecting can plausibly fix this failure.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Connection { kind } => !matches!(
+                kind,
+                StreamErrorKind::Unauthenticated | StreamErrorKind::InvalidRequest
+            ),
+            Self::StreamClosed | Self::IdleTimeout { .. } | Self::ConnectTimeout { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+/// Failures of the exit manager (Phase 5): plan validation, sell quoting and
+/// order dispatch.
+///
+/// Variants carry only static labels, numbers and the (log-safe) Jito and builder
+/// errors. `PartialEq` is not derived because [`JitoError`] wraps transport errors.
+#[derive(Debug, Error)]
+pub enum ExitError {
+    /// The exit plan is inconsistent (empty, out of window, fractions above 100 %).
+    #[error("invalid exit plan: {reason}")]
+    InvalidPlan {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// An exit setting is out of range.
+    #[error("invalid exit configuration: {reason}")]
+    InvalidConfig {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// A tranche came due before any bonding curve state was observed.
+    #[error("no bonding curve state observed yet; cannot quote a sell")]
+    NoCurveState,
+
+    /// The curve already completed (graduated); `sell_v3` is no longer possible.
+    #[error("the bonding curve is complete; selling on the curve is no longer possible")]
+    CurveComplete,
+
+    /// Cashback coins reject `sell_v3` on chain (`CashbackCoinNotSupported`).
+    #[error("cashback coins are not supported by sell_v3")]
+    CashbackCoinUnsupported,
+
+    /// A tranche came due too late to be issued inside the execution window.
+    #[error("tranche {tranche} missed the execution window")]
+    WindowMissed {
+        /// Zero-based index of the tranche in the plan.
+        tranche: u8,
+    },
+
+    /// Issuing another order would exceed the total fee budget.
+    #[error("order cost of {cost} lamports would exceed the remaining budget of {remaining}")]
+    BudgetExceeded {
+        /// Worst-case cost of the order, in lamports.
+        cost: u64,
+        /// Budget left, in lamports.
+        remaining: u64,
+    },
+
+    /// The order channel is closed (executor gone).
+    #[error("the sell order channel is closed")]
+    OrderChannelClosed,
+
+    /// The order channel is full (executor stalled).
+    #[error("the sell order channel is full")]
+    OrderChannelFull,
+
+    /// Checked arithmetic overflowed.
+    #[error("arithmetic overflow while computing {context}")]
+    ArithmeticOverflow {
+        /// What was being computed.
+        context: &'static str,
+    },
+
+    /// Sell quoting or transaction assembly failed.
+    #[error("sell builder error: {0}")]
+    Builder(#[from] BuilderError),
+
+    /// Bundle submission failed.
+    #[error("Jito error: {0}")]
+    Jito(#[from] JitoError),
 }

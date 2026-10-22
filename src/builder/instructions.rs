@@ -16,11 +16,12 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use super::constants::{
     ASSOCIATED_TOKEN_PROGRAM_ID, ATA_CREATE_IDEMPOTENT, COMPUTE_BUDGET_PROGRAM_ID,
     COMPUTE_BUDGET_SET_UNIT_LIMIT, COMPUTE_BUDGET_SET_UNIT_PRICE, DISCRIMINATOR_BUY_V3,
-    DISCRIMINATOR_CREATE, DISCRIMINATOR_CREATE_V2, MAX_NAME_BYTES, MAX_SYMBOL_BYTES, MAX_URI_BYTES,
-    MAYHEM_PROGRAM_ID, MPL_TOKEN_METADATA_PROGRAM_ID, PUMP_PROGRAM_ID, RENT_SYSVAR_ID,
-    SYSTEM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, WSOL_MINT,
+    DISCRIMINATOR_CREATE, DISCRIMINATOR_CREATE_V2, DISCRIMINATOR_SELL_V3, MAX_NAME_BYTES,
+    MAX_SYMBOL_BYTES, MAX_URI_BYTES, MAYHEM_PROGRAM_ID, MPL_TOKEN_METADATA_PROGRAM_ID,
+    PUMP_PROGRAM_ID, RENT_SYSVAR_ID, SYSTEM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
+    WSOL_MINT,
 };
-use super::math::BuyPlan;
+use super::math::{BuyPlan, SellPlan};
 use super::pda::{CreateVariant, LaunchAddresses};
 use crate::errors::BuilderError;
 use crate::storage::{TokenMetadata, UploadedMetadata};
@@ -289,6 +290,32 @@ pub fn buy_v3_data(plan: &BuyPlan) -> Vec<u8> {
     data
 }
 
+/// The 17 accounts shared by `buy_v3` and `sell_v3`, in IDL order.
+fn trade_v3_accounts(
+    addresses: &LaunchAddresses,
+    buyback_fee_recipient: &Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(addresses.global, false),
+        AccountMeta::new_readonly(addresses.mint, false),
+        AccountMeta::new_readonly(WSOL_MINT, false),
+        AccountMeta::new_readonly(addresses.token_program, false),
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        AccountMeta::new(addresses.bonding_curve, false),
+        AccountMeta::new(addresses.associated_bonding_curve, false),
+        AccountMeta::new(addresses.associated_quote_bonding_curve, false),
+        AccountMeta::new(addresses.user, true),
+        AccountMeta::new(addresses.associated_user, false),
+        AccountMeta::new(addresses.associated_quote_user, false),
+        AccountMeta::new(addresses.user_volume_accumulator, false),
+        AccountMeta::new_readonly(addresses.fee_config, false),
+        AccountMeta::new(*buyback_fee_recipient, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        AccountMeta::new_readonly(addresses.event_authority, false),
+        AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
+    ]
+}
+
 /// Builds the SOL-paired `buy_v3` instruction (17 accounts).
 ///
 /// The buyer's token account (`addresses.associated_user`) must exist when this
@@ -301,25 +328,38 @@ pub fn buy_v3_instruction(
 ) -> Instruction {
     Instruction {
         program_id: PUMP_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new_readonly(addresses.global, false),
-            AccountMeta::new_readonly(addresses.mint, false),
-            AccountMeta::new_readonly(WSOL_MINT, false),
-            AccountMeta::new_readonly(addresses.token_program, false),
-            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            AccountMeta::new(addresses.bonding_curve, false),
-            AccountMeta::new(addresses.associated_bonding_curve, false),
-            AccountMeta::new(addresses.associated_quote_bonding_curve, false),
-            AccountMeta::new(addresses.user, true),
-            AccountMeta::new(addresses.associated_user, false),
-            AccountMeta::new(addresses.associated_quote_user, false),
-            AccountMeta::new(addresses.user_volume_accumulator, false),
-            AccountMeta::new_readonly(addresses.fee_config, false),
-            AccountMeta::new(*buyback_fee_recipient, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(addresses.event_authority, false),
-            AccountMeta::new_readonly(PUMP_PROGRAM_ID, false),
-        ],
+        accounts: trade_v3_accounts(addresses, buyback_fee_recipient),
         data: buy_v3_data(plan),
+    }
+}
+
+// --- Pump.fun sell --------------------------------------------------------------------
+
+/// Instruction data of `sell_v3`: discriminator, `amount`, `min_sol_output`
+/// (little-endian `u64`s).
+#[must_use]
+pub fn sell_v3_data(plan: &SellPlan) -> Vec<u8> {
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&DISCRIMINATOR_SELL_V3);
+    data.extend_from_slice(&plan.token_amount.to_le_bytes());
+    data.extend_from_slice(&plan.min_sol_output_lamports.to_le_bytes());
+    data
+}
+
+/// Builds the SOL-paired `sell_v3` instruction. It takes the **same 17 accounts
+/// in the same order** as `buy_v3` (`docs/TRADE_V3.md`); only the data differs.
+///
+/// Cashback coins reject `sell_v3` on chain; the exit manager checks the flag
+/// before quoting.
+#[must_use]
+pub fn sell_v3_instruction(
+    addresses: &LaunchAddresses,
+    plan: &SellPlan,
+    buyback_fee_recipient: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: PUMP_PROGRAM_ID,
+        accounts: trade_v3_accounts(addresses, buyback_fee_recipient),
+        data: sell_v3_data(plan),
     }
 }

@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-3 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) en curso en `phase4-jito-engine`. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) en curso en `phase5-monitor-exit`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
@@ -21,6 +21,9 @@ src/
   builder/                 Fase 3: constants, pda, math, instructions, transaction (Create + Buy atómico)
     alt.rs                 Fase 4: Address Lookup Table (crear/extender/decodificar, LaunchLookupTable)
   network/jito.rs          Fase 4: cliente JSON-RPC del Block Engine, tip, ensamblado del bundle
+  monitor/                 Fase 5: geyser (supervisor del stream), curve, exit (motor de salida por tramos), submit (Jito)
+  builder/sell.rs          Fase 5: SellBuilder (sell_v3 firmado)
+  docs/yellowstone-adapter.md  Contrato del adaptador gRPC de Yellowstone
   monitor/                 andamiaje para la fase 5
 tests/phase1_tests.rs      pruebas de wallet, zeroize y configuración
 tests/phase2_tests.rs      pruebas del motor de metadatos (servidor HTTP simulado)

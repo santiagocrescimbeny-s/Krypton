@@ -81,6 +81,27 @@ pub const DISCRIMINATOR_CREATE: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 pub const DISCRIMINATOR_CREATE_V2: [u8; 8] = [214, 144, 76, 236, 95, 139, 49, 180];
 /// `buy_v3` (17-account buy; fees stay on the curve until swept).
 pub const DISCRIMINATOR_BUY_V3: [u8; 8] = [7, 5, 29, 196, 245, 23, 101, 80];
+/// `sell_v3` (same 17 accounts as `buy_v3`; arguments `amount`, `min_sol_output`).
+pub const DISCRIMINATOR_SELL_V3: [u8; 8] = [28, 146, 222, 119, 38, 196, 105, 213];
+
+/// Anchor account discriminator of `BondingCurve` (`sha256("account:BondingCurve")[..8]`).
+pub const DISCRIMINATOR_BONDING_CURVE_ACCOUNT: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
+
+/// Every instruction that buys from the curve (legacy, v2 and v3 families).
+pub const DISCRIMINATORS_BUY: [[u8; 8]; 6] = [
+    [102, 6, 61, 18, 1, 218, 235, 234],     // buy
+    [184, 23, 238, 97, 103, 197, 211, 61],  // buy_v2
+    [7, 5, 29, 196, 245, 23, 101, 80],      // buy_v3
+    [56, 252, 116, 8, 158, 223, 205, 95],   // buy_exact_sol_in
+    [194, 171, 28, 70, 104, 77, 91, 47],    // buy_exact_quote_in_v2
+    [225, 247, 80, 30, 213, 179, 132, 136], // buy_exact_quote_in_v3
+];
+/// Every instruction that sells to the curve (`sell`, `sell_v2`, `sell_v3`).
+pub const DISCRIMINATORS_SELL: [[u8; 8]; 3] = [
+    [51, 230, 133, 164, 1, 127, 131, 173],
+    [93, 246, 130, 60, 231, 233, 64, 178],
+    [28, 146, 222, 119, 38, 196, 105, 213],
+];
 
 /// Compute Budget `SetComputeUnitLimit` tag.
 pub const COMPUTE_BUDGET_SET_UNIT_LIMIT: u8 = 2;
