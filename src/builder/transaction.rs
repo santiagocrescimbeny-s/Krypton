@@ -28,14 +28,18 @@ use solana_sdk::message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::transaction::VersionedTransaction;
 use zeroize::Zeroizing;
 
-use super::constants::{select_buyback_fee_recipient, MAX_TRANSACTION_SIZE};
+use super::constants::{
+    select_buyback_fee_recipient, BASE_SIGNATURE_FEE_LAMPORTS, LAUNCH_SIGNATURE_COUNT,
+    MAX_TRANSACTION_SIZE, PAYER_RENT_EXEMPT_RESERVE_LAMPORTS, TOKEN_ACCOUNT_RENT_2022_LAMPORTS,
+    TOKEN_ACCOUNT_RENT_LEGACY_LAMPORTS, USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS,
+};
 use super::instructions::{
     buy_v3_instruction, create_associated_token_account_idempotent, create_instruction,
     set_compute_unit_limit, set_compute_unit_price, CreateOptions, LaunchMetadata,
 };
-use super::math::{BuyPlan, CurveParams, DEFAULT_TOTAL_FEE_BPS};
+use super::math::{BuyPlan, CurveParams, DEFAULT_TOTAL_FEE_BPS, MAX_SLIPPAGE_BPS};
 use super::pda::{CreateVariant, LaunchAddresses};
-use crate::config::Config;
+use crate::config::{priority_fee_lamports, Config, ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS};
 use crate::errors::BuilderError;
 use crate::security::SecureWallet;
 
@@ -133,8 +137,27 @@ pub struct LaunchParams {
     pub compute_unit_limit: u32,
     /// Priority fee, in micro-lamports per compute unit.
     pub priority_fee_micro_lamports: u64,
+    /// Hard cap on the priority fee actually paid (`price x compute unit
+    /// limit`), in lamports. [`LaunchBuilder::new`] refuses anything above it,
+    /// and never accepts more than [`ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS`].
+    pub max_priority_fee_lamports: u64,
     /// Buyback fee recipient; derived from the mint when `None`.
     pub buyback_fee_recipient: Option<Pubkey>,
+}
+
+/// What the payer holds and what the launch needs beyond the curve itself.
+///
+/// Both extras are supplied by the caller on purpose: the rent of the accounts
+/// created by `Create` is best measured with the Phase 4 simulation (never
+/// hard-coded), and the Jito tip is only known once the bundle is assembled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingSnapshot {
+    /// Current lamport balance of the payer (from `getBalance`).
+    pub available_lamports: u64,
+    /// Rent of the accounts `Create` allocates (mint, bonding curve, ...).
+    pub create_rent_lamports: u64,
+    /// Jito tip that will be appended to the bundle (0 when none).
+    pub tip_lamports: u64,
 }
 
 impl LaunchParams {
@@ -166,7 +189,59 @@ impl LaunchParams {
             buy,
             compute_unit_limit: config.compute_unit_limit,
             priority_fee_micro_lamports: config.priority_fee_micro_lamports,
+            max_priority_fee_lamports: config.max_priority_fee_lamports,
             buyback_fee_recipient: None,
+        })
+    }
+
+    /// Priority fee this launch pays, in lamports (`price x CU limit`, rounded up).
+    #[must_use]
+    pub fn priority_fee_lamports(&self) -> u128 {
+        priority_fee_lamports(self.priority_fee_micro_lamports, self.compute_unit_limit)
+    }
+
+    /// Worst-case lamports the payer must hold before the transaction is sent.
+    ///
+    /// The sum of: the buy's `max_sol_cost` (slippage included), the rent of the
+    /// buyer's token account and `user_volume_accumulator`, the base signature
+    /// fees, the priority fee, `create_rent_lamports`, `tip_lamports`, and the
+    /// rent-exempt minimum the payer account must keep afterwards.
+    ///
+    /// # Errors
+    /// [`BuilderError::ArithmeticOverflow`] if any term or the sum overflows.
+    pub fn required_balance(
+        &self,
+        create_rent_lamports: u64,
+        tip_lamports: u64,
+    ) -> Result<u64, BuilderError> {
+        let priority = u64::try_from(self.priority_fee_lamports()).map_err(|_| {
+            BuilderError::ArithmeticOverflow {
+                context: "priority fee",
+            }
+        })?;
+        let signature_fees = BASE_SIGNATURE_FEE_LAMPORTS
+            .checked_mul(LAUNCH_SIGNATURE_COUNT)
+            .ok_or(BuilderError::ArithmeticOverflow {
+                context: "signature fees",
+            })?;
+        let token_account_rent = match self.variant {
+            CreateVariant::CreateV2 => TOKEN_ACCOUNT_RENT_2022_LAMPORTS,
+            CreateVariant::LegacyCreate => TOKEN_ACCOUNT_RENT_LEGACY_LAMPORTS,
+        };
+        [
+            self.buy.max_sol_cost_lamports,
+            token_account_rent,
+            USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS,
+            signature_fees,
+            priority,
+            create_rent_lamports,
+            tip_lamports,
+            PAYER_RENT_EXEMPT_RESERVE_LAMPORTS,
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or(BuilderError::ArithmeticOverflow {
+            context: "required balance",
         })
     }
 
@@ -217,6 +292,23 @@ impl LaunchBuilder {
     /// - [`BuilderError::UnsupportedOption`] if the legacy variant is combined
     ///   with `create_v2`-only options.
     pub fn new(payer: Pubkey, mint: Pubkey, params: LaunchParams) -> Result<Self, BuilderError> {
+        // Safety guards that hold no matter how `LaunchParams` was assembled.
+        if params.buy.slippage_bps > MAX_SLIPPAGE_BPS {
+            return Err(BuilderError::InvalidSlippage {
+                bps: params.buy.slippage_bps,
+                max: MAX_SLIPPAGE_BPS,
+            });
+        }
+        let fee_cap = params
+            .max_priority_fee_lamports
+            .min(ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS);
+        let fee = params.priority_fee_lamports();
+        if fee > u128::from(fee_cap) {
+            return Err(BuilderError::PriorityFeeTooHigh {
+                fee_lamports: fee,
+                max: fee_cap,
+            });
+        }
         if params.variant == CreateVariant::LegacyCreate
             && params.options != CreateOptions::default()
         {
@@ -248,6 +340,26 @@ impl LaunchBuilder {
     #[must_use]
     pub fn params(&self) -> &LaunchParams {
         &self.params
+    }
+
+    /// Pre-flight balance check: the payer must hold the worst-case cost of the
+    /// launch (see [`LaunchParams::required_balance`]). Returns the required
+    /// amount on success so callers can log it.
+    ///
+    /// # Errors
+    /// - [`BuilderError::InsufficientBalance`] when `available_lamports` is lower;
+    /// - [`BuilderError::ArithmeticOverflow`] from the cost computation.
+    pub fn ensure_funded(&self, funding: &FundingSnapshot) -> Result<u64, BuilderError> {
+        let required = self
+            .params
+            .required_balance(funding.create_rent_lamports, funding.tip_lamports)?;
+        if funding.available_lamports < required {
+            return Err(BuilderError::InsufficientBalance {
+                required,
+                available: funding.available_lamports,
+            });
+        }
+        Ok(required)
     }
 
     /// The ordered instruction list:
@@ -330,6 +442,26 @@ impl LaunchBuilder {
             &[&wallet_keypair, &mint_keypair],
         )
         .map_err(|err| BuilderError::Signing(err.to_string()))
+    }
+
+    /// Like [`LaunchBuilder::build_signed`], but runs
+    /// [`LaunchBuilder::ensure_funded`] first: no message is assembled and no key
+    /// is touched unless the payer can afford the launch.
+    ///
+    /// # Errors
+    /// See [`LaunchBuilder::ensure_funded`], [`LaunchBuilder::compile`] and
+    /// [`LaunchBuilder::sign`].
+    pub fn build_signed_checked(
+        &self,
+        funding: &FundingSnapshot,
+        recent_blockhash: Hash,
+        lookup_tables: &[AddressLookupTableAccount],
+        trailing: &[Instruction],
+        wallet: &SecureWallet,
+        mint: &MintSigner,
+    ) -> Result<VersionedTransaction, BuilderError> {
+        self.ensure_funded(funding)?;
+        self.build_signed(recent_blockhash, lookup_tables, trailing, wallet, mint)
     }
 
     /// Convenience: [`LaunchBuilder::compile`] followed by [`LaunchBuilder::sign`].

@@ -58,6 +58,8 @@ pub const ENV_SLIPPAGE_BPS: &str = "SLIPPAGE_BPS";
 pub const ENV_COMPUTE_UNIT_LIMIT: &str = "COMPUTE_UNIT_LIMIT";
 /// Priority fee in micro-lamports per compute unit.
 pub const ENV_PRIORITY_FEE_MICRO_LAMPORTS: &str = "PRIORITY_FEE_MICRO_LAMPORTS";
+/// Hard ceiling on the priority fee actually paid, in lamports (optional).
+pub const ENV_MAX_PRIORITY_FEE_LAMPORTS: &str = "MAX_PRIORITY_FEE_LAMPORTS";
 /// Jito tip in lamports.
 pub const ENV_JITO_TIP_LAMPORTS: &str = "JITO_TIP_LAMPORTS";
 /// Dry-run switch.
@@ -69,7 +71,7 @@ pub const ENV_LOG_LEVEL: &str = "LOG_LEVEL";
 
 /// Every variable the configuration reads. Must stay in sync with [`RawConfig`]
 /// (its fields are renamed to these exact names).
-pub const ENV_KEYS: [&str; 14] = [
+pub const ENV_KEYS: [&str; 15] = [
     ENV_RPC_URL,
     ENV_RPC_WS_URL,
     ENV_JITO_ENGINE_URL,
@@ -80,6 +82,7 @@ pub const ENV_KEYS: [&str; 14] = [
     ENV_SLIPPAGE_BPS,
     ENV_COMPUTE_UNIT_LIMIT,
     ENV_PRIORITY_FEE_MICRO_LAMPORTS,
+    ENV_MAX_PRIORITY_FEE_LAMPORTS,
     ENV_JITO_TIP_LAMPORTS,
     ENV_DRY_RUN,
     ENV_LOG_DIR,
@@ -90,14 +93,24 @@ pub const ENV_KEYS: [&str; 14] = [
 
 /// Default slippage: 5%.
 pub const DEFAULT_SLIPPAGE_BPS: u16 = 500;
-/// Slippage ceiling: 100%.
-pub const MAX_SLIPPAGE_BPS: u16 = 10_000;
+/// Slippage ceiling: 10 %.
+///
+/// A launch is one atomic `Create` + `Buy` transaction, so nobody can trade in
+/// between: slippage only has to absorb a mismatch between the assumed and the
+/// live fee/curve parameters. A wider tolerance would turn `max_sol_cost` into
+/// a blank cheque (audit finding #20), hence the hard bound.
+pub const MAX_SLIPPAGE_BPS: u16 = 1_000;
 /// Default compute unit limit (enough for create + buy with headroom).
 pub const DEFAULT_COMPUTE_UNIT_LIMIT: u32 = 300_000;
 /// Solana's per-transaction compute unit ceiling.
 pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 /// Default priority fee in micro-lamports per compute unit.
 pub const DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS: u64 = 100_000;
+/// Default cap on the priority fee actually paid: 0.005 SOL.
+pub const DEFAULT_MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000_000;
+/// Absolute ceiling for the configurable priority-fee cap: 0.05 SOL. No value of
+/// `MAX_PRIORITY_FEE_LAMPORTS` can lift the cap above this.
+pub const ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 50_000_000;
 /// Default Jito tip in lamports.
 pub const DEFAULT_JITO_TIP_LAMPORTS: u64 = 100_000;
 /// Smallest tip the Jito Block Engine accepts for a bundle.
@@ -127,6 +140,7 @@ struct RawConfig {
     slippage_bps: Option<String>,
     compute_unit_limit: Option<String>,
     priority_fee_micro_lamports: Option<String>,
+    max_priority_fee_lamports: Option<String>,
     jito_tip_lamports: Option<String>,
     dry_run: Option<String>,
     log_dir: Option<String>,
@@ -152,12 +166,15 @@ pub struct Config {
     pub preflight_commitment: CommitmentConfig,
     /// Creator's initial buy, in lamports (parsed exactly from `CREATOR_SOL_AMOUNT`).
     pub creator_buy_lamports: u64,
-    /// Slippage tolerance in basis points (0..=10_000).
+    /// Slippage tolerance in basis points (`0..=`[`MAX_SLIPPAGE_BPS`]).
     pub slippage_bps: u16,
     /// Compute unit limit (1..=1_400_000).
     pub compute_unit_limit: u32,
     /// Priority fee, micro-lamports per compute unit.
     pub priority_fee_micro_lamports: u64,
+    /// Hard cap on the priority fee actually paid (`price x CU limit`), in
+    /// lamports. Validated against [`ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS`].
+    pub max_priority_fee_lamports: u64,
     /// Jito tip in lamports (>= 1_000).
     pub jito_tip_lamports: u64,
     /// When `true` nothing is ever submitted to the network.
@@ -268,7 +285,7 @@ impl Config {
         if slippage_bps > MAX_SLIPPAGE_BPS {
             return Err(invalid(
                 ENV_SLIPPAGE_BPS,
-                "must be at most 10000 basis points (100%)",
+                "must be at most 1000 basis points (10%)",
             ));
         }
 
@@ -287,6 +304,28 @@ impl Config {
             Some(text) => parse_number::<u64>(ENV_PRIORITY_FEE_MICRO_LAMPORTS, &text)?,
             None => DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS,
         };
+
+        let max_priority_fee_lamports = match clean(raw.max_priority_fee_lamports) {
+            Some(text) => parse_number::<u64>(ENV_MAX_PRIORITY_FEE_LAMPORTS, &text)?,
+            None => DEFAULT_MAX_PRIORITY_FEE_LAMPORTS,
+        };
+        if max_priority_fee_lamports > ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS {
+            return Err(invalid(
+                ENV_MAX_PRIORITY_FEE_LAMPORTS,
+                "must be at most 50000000 lamports (0.05 SOL)",
+            ));
+        }
+        // The fee actually charged is `price x requested CU limit`, not the CU
+        // actually consumed, so a typo in the price can cost a fortune (audit
+        // finding #19). Reject it before anything is built.
+        if priority_fee_lamports(priority_fee_micro_lamports, compute_unit_limit)
+            > u128::from(max_priority_fee_lamports)
+        {
+            return Err(invalid(
+                ENV_PRIORITY_FEE_MICRO_LAMPORTS,
+                "price x COMPUTE_UNIT_LIMIT exceeds MAX_PRIORITY_FEE_LAMPORTS",
+            ));
+        }
 
         let jito_tip_lamports = match clean(raw.jito_tip_lamports) {
             Some(text) => parse_number::<u64>(ENV_JITO_TIP_LAMPORTS, &text)?,
@@ -338,6 +377,7 @@ impl Config {
             slippage_bps,
             compute_unit_limit,
             priority_fee_micro_lamports,
+            max_priority_fee_lamports,
             jito_tip_lamports,
             dry_run,
             log_dir: clean(raw.log_dir)
@@ -380,6 +420,7 @@ impl fmt::Debug for Config {
                 "priority_fee_micro_lamports",
                 &self.priority_fee_micro_lamports,
             )
+            .field("max_priority_fee_lamports", &self.max_priority_fee_lamports)
             .field("jito_tip_lamports", &self.jito_tip_lamports)
             .field("dry_run", &self.dry_run)
             .field("log_dir", &self.log_dir)
@@ -401,6 +442,17 @@ pub fn redact_url(url: &Url) -> String {
 }
 
 // --- Helpers -------------------------------------------------------------------
+
+/// Priority fee in lamports that the network charges for a transaction:
+/// `ceil(price_micro_lamports x compute_unit_limit / 1_000_000)`.
+///
+/// Computed in `u128`: the product of a `u64` and a `u32` is below `2^96`, so it
+/// can neither overflow nor be truncated, which makes the cap comparison exact
+/// for every input.
+#[must_use]
+pub fn priority_fee_lamports(price_micro_lamports: u64, compute_unit_limit: u32) -> u128 {
+    (u128::from(price_micro_lamports) * u128::from(compute_unit_limit)).div_ceil(1_000_000)
+}
 
 /// Reads exactly `path` (no parent-directory search). A missing file is fine.
 fn load_dotenv(path: &Path) -> Result<(), ConfigError> {

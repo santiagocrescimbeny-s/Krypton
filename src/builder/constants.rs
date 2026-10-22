@@ -113,6 +113,27 @@ pub const MAX_URI_BYTES: usize = 200;
 /// Maximum size of a serialized transaction (Solana packet data size).
 pub const MAX_TRANSACTION_SIZE: usize = 1232;
 
+// --- Rent and fee reserves (lamports) ---------------------------------------------
+//
+// Used by `LaunchParams::required_balance`. Rent-exempt minimum is
+// `(data_len + 128) * 6960` lamports.
+
+/// Rent of a legacy SPL token account (165 bytes).
+pub const TOKEN_ACCOUNT_RENT_LEGACY_LAMPORTS: u64 = 2_039_280;
+/// Rent of a Token-2022 associated token account (170 bytes: 165 + account type
+/// + the `ImmutableOwner` extension that the ATA program always adds).
+pub const TOKEN_ACCOUNT_RENT_2022_LAMPORTS: u64 = 2_074_080;
+/// Rent of the buyer's `user_volume_accumulator` (137 bytes), created by the
+/// first trade of a wallet. Conservatively always reserved.
+pub const USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS: u64 = 1_844_400;
+/// Base network fee per signature.
+pub const BASE_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+/// Signatures of a launch: the fee payer and the new mint.
+pub const LAUNCH_SIGNATURE_COUNT: u64 = 2;
+/// Rent-exempt minimum of a data-less system account. The fee payer must not
+/// end the transaction with a non-zero balance below it.
+pub const PAYER_RENT_EXEMPT_RESERVE_LAMPORTS: u64 = 890_880;
+
 // --- Fee recipients ------------------------------------------------------------------
 
 /// The eight official buyback fee recipient wallets (`docs/FEE_RECIPIENTS.md`).

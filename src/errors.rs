@@ -405,6 +405,24 @@ pub enum BuilderError {
     #[error("failed to compile the v0 message: {0}")]
     MessageCompile(String),
 
+    /// The priority fee (`price x compute unit limit`) is above the configured cap.
+    #[error("priority fee of {fee_lamports} lamports exceeds the cap of {max} lamports")]
+    PriorityFeeTooHigh {
+        /// Fee the transaction would pay, in lamports.
+        fee_lamports: u128,
+        /// Effective cap, in lamports.
+        max: u64,
+    },
+
+    /// The fee payer cannot cover the worst-case cost of the launch.
+    #[error("insufficient balance: {required} lamports required, {available} available")]
+    InsufficientBalance {
+        /// Worst-case lamports the launch needs.
+        required: u64,
+        /// Lamports the payer holds.
+        available: u64,
+    },
+
     /// The signed transaction would not fit in a single packet.
     #[error("transaction is {size} bytes, above the {max} byte packet limit")]
     TransactionTooLarge {

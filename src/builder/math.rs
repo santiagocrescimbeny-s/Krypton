@@ -30,8 +30,9 @@ pub const BPS_DENOMINATOR: u128 = 10_000;
 pub const DEFAULT_TOTAL_FEE_BPS: u16 = 125;
 /// Highest fee assumption accepted (10 %); a guard against typos.
 pub const MAX_FEE_BPS: u16 = 1_000;
-/// Highest slippage tolerance accepted (100 %), same as the config layer.
-pub const MAX_SLIPPAGE_BPS: u16 = 10_000;
+/// Highest slippage tolerance accepted. Single source of truth: the config
+/// layer's bound (10 %), so the two can never drift apart (audit finding #20).
+pub const MAX_SLIPPAGE_BPS: u16 = crate::config::MAX_SLIPPAGE_BPS;
 
 /// Reserves of a freshly created bonding curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

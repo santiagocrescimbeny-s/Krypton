@@ -13,8 +13,9 @@ use std::error::Error;
 use std::mem::ManuallyDrop;
 
 use krypton::config::{
-    redact_url, Config, DEFAULT_COMPUTE_UNIT_LIMIT, DEFAULT_JITO_TIP_LAMPORTS,
-    DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS, DEFAULT_SLIPPAGE_BPS, ENV_KEYS,
+    priority_fee_lamports, redact_url, Config, ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS,
+    DEFAULT_COMPUTE_UNIT_LIMIT, DEFAULT_JITO_TIP_LAMPORTS, DEFAULT_MAX_PRIORITY_FEE_LAMPORTS,
+    DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS, DEFAULT_SLIPPAGE_BPS, ENV_KEYS, MAX_SLIPPAGE_BPS,
 };
 use krypton::errors::{ConfigError, LauncherError, WalletError};
 use krypton::security::wallet::{KEYPAIR_BYTES, PUBLIC_KEY_BYTES};
@@ -407,6 +408,10 @@ fn minimal_configuration_applies_safe_defaults() -> TestResult {
         config.priority_fee_micro_lamports,
         DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS
     );
+    assert_eq!(
+        config.max_priority_fee_lamports,
+        DEFAULT_MAX_PRIORITY_FEE_LAMPORTS
+    );
     assert_eq!(config.jito_tip_lamports, DEFAULT_JITO_TIP_LAMPORTS);
     assert!(
         config.dry_run,
@@ -431,9 +436,10 @@ fn every_documented_variable_is_honoured() -> TestResult {
         ("COMMITMENT", "finalized"),
         ("PREFLIGHT_COMMITMENT", "confirmed"),
         ("CREATOR_SOL_AMOUNT", "1.25"),
-        ("SLIPPAGE_BPS", "1200"),
+        ("SLIPPAGE_BPS", "900"),
         ("COMPUTE_UNIT_LIMIT", "400000"),
         ("PRIORITY_FEE_MICRO_LAMPORTS", "250000"),
+        ("MAX_PRIORITY_FEE_LAMPORTS", "200000"),
         ("JITO_TIP_LAMPORTS", "5000000"),
         ("DRY_RUN", "false"),
         ("LOG_DIR", "var/krypton-logs"),
@@ -453,9 +459,10 @@ fn every_documented_variable_is_honoured() -> TestResult {
     assert_eq!(config.commitment, CommitmentConfig::finalized());
     assert_eq!(config.preflight_commitment, CommitmentConfig::confirmed());
     assert_eq!(config.creator_buy_lamports, 1_250_000_000);
-    assert_eq!(config.slippage_bps, 1200);
+    assert_eq!(config.slippage_bps, 900);
     assert_eq!(config.compute_unit_limit, 400_000);
     assert_eq!(config.priority_fee_micro_lamports, 250_000);
+    assert_eq!(config.max_priority_fee_lamports, 200_000);
     assert_eq!(config.jito_tip_lamports, 5_000_000);
     assert!(!config.dry_run);
     assert_eq!(config.log_dir, std::path::PathBuf::from("var/krypton-logs"));
@@ -470,7 +477,7 @@ fn every_documented_variable_is_honoured() -> TestResult {
 
 #[test]
 fn env_key_list_is_complete_and_unique() {
-    assert_eq!(ENV_KEYS.len(), 14);
+    assert_eq!(ENV_KEYS.len(), 15);
     let unique: std::collections::HashSet<_> = ENV_KEYS.iter().collect();
     assert_eq!(unique.len(), ENV_KEYS.len());
 }
@@ -514,7 +521,8 @@ fn blank_optionals_fall_back_to_defaults_and_unknown_keys_are_ignored() -> TestR
 fn boundary_values_are_accepted() -> TestResult {
     for (key, value) in [
         ("SLIPPAGE_BPS", "0"),
-        ("SLIPPAGE_BPS", "10000"),
+        ("SLIPPAGE_BPS", "1000"),
+        ("MAX_PRIORITY_FEE_LAMPORTS", "50000000"),
         ("COMPUTE_UNIT_LIMIT", "1"),
         ("COMPUTE_UNIT_LIMIT", "1400000"),
         ("JITO_TIP_LAMPORTS", "1000"),
@@ -525,6 +533,141 @@ fn boundary_values_are_accepted() -> TestResult {
     ] {
         Config::from_vars(with(minimal_vars(), key, value))?;
     }
+    Ok(())
+}
+
+// =================================================================================
+// Configuration: spending guards (priority fee cap, slippage bound)
+// =================================================================================
+
+#[test]
+fn priority_fee_is_price_times_cu_limit_rounded_up() {
+    assert_eq!(priority_fee_lamports(0, 1_400_000), 0);
+    assert_eq!(priority_fee_lamports(1, 1), 1);
+    assert_eq!(priority_fee_lamports(1_000_000, 1), 1);
+    assert_eq!(priority_fee_lamports(1_000_001, 1), 2);
+    assert_eq!(priority_fee_lamports(100_000, 300_000), 30_000);
+    // The widest possible input does not overflow and exceeds `u64`.
+    let widest = priority_fee_lamports(u64::MAX, u32::MAX);
+    assert_eq!(widest, 79_228_162_495_817_593_515_540);
+    assert!(widest > u128::from(u64::MAX));
+}
+
+// Compile-time invariants between the limits (a violation fails the build).
+const _: () = assert!(DEFAULT_MAX_PRIORITY_FEE_LAMPORTS <= ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS);
+const _: () = assert!(DEFAULT_SLIPPAGE_BPS <= MAX_SLIPPAGE_BPS);
+
+#[test]
+fn the_slippage_bound_is_ten_percent_and_the_fee_ceiling_is_five_hundredths_of_a_sol() {
+    assert_eq!(MAX_SLIPPAGE_BPS, 1_000);
+    assert_eq!(ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS, 50_000_000);
+    assert_eq!(DEFAULT_MAX_PRIORITY_FEE_LAMPORTS, 5_000_000);
+}
+
+#[test]
+fn slippage_is_bounded_at_exactly_the_maximum() -> TestResult {
+    let at_limit = MAX_SLIPPAGE_BPS.to_string();
+    let config = Config::from_vars(with(minimal_vars(), "SLIPPAGE_BPS", &at_limit))?;
+    assert_eq!(config.slippage_bps, MAX_SLIPPAGE_BPS);
+
+    let above = (MAX_SLIPPAGE_BPS + 1).to_string();
+    let err = err_of(Config::from_vars(with(
+        minimal_vars(),
+        "SLIPPAGE_BPS",
+        &above,
+    )))?;
+    assert!(
+        matches!(err, ConfigError::InvalidVar { name, .. } if name == "SLIPPAGE_BPS"),
+        "{err}"
+    );
+    // A "100 % slippage" blank cheque is refused.
+    assert!(Config::from_vars(with(minimal_vars(), "SLIPPAGE_BPS", "10000")).is_err());
+    Ok(())
+}
+
+#[test]
+fn a_runaway_priority_fee_is_rejected_before_anything_is_built() -> TestResult {
+    // 1e12 micro-lamports x 1.4M CU would burn about 1400 SOL.
+    let runaway = with(
+        with(
+            minimal_vars(),
+            "PRIORITY_FEE_MICRO_LAMPORTS",
+            "1000000000000",
+        ),
+        "COMPUTE_UNIT_LIMIT",
+        "1400000",
+    );
+    let err = err_of(Config::from_vars(runaway))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "PRIORITY_FEE_MICRO_LAMPORTS"),
+        "{err}"
+    );
+    // The message states the rule but never echoes the offending number.
+    assert!(!err.to_string().contains("1000000000000"));
+    Ok(())
+}
+
+#[test]
+fn priority_fee_cap_boundary_is_exact() -> TestResult {
+    // Default cap = 5_000_000 lamports = 5_000_000 micro-lamports x 1_000_000 CU.
+    let at_cap = with(
+        with(minimal_vars(), "PRIORITY_FEE_MICRO_LAMPORTS", "5000000"),
+        "COMPUTE_UNIT_LIMIT",
+        "1000000",
+    );
+    let config = Config::from_vars(at_cap.clone())?;
+    assert_eq!(
+        priority_fee_lamports(
+            config.priority_fee_micro_lamports,
+            config.compute_unit_limit
+        ),
+        u128::from(DEFAULT_MAX_PRIORITY_FEE_LAMPORTS)
+    );
+
+    // One micro-lamport more costs one extra lamport and is refused.
+    let over = with(at_cap, "PRIORITY_FEE_MICRO_LAMPORTS", "5000001");
+    let err = err_of(Config::from_vars(over))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "PRIORITY_FEE_MICRO_LAMPORTS"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_priority_fee_cap_is_configurable_but_has_an_absolute_ceiling() -> TestResult {
+    // Defaults cost 30_000 lamports: a cap of 29_999 refuses them, 30_000 accepts.
+    let tight = with(minimal_vars(), "MAX_PRIORITY_FEE_LAMPORTS", "29999");
+    let err = err_of(Config::from_vars(tight))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "PRIORITY_FEE_MICRO_LAMPORTS"),
+        "{err}"
+    );
+    let exact = with(minimal_vars(), "MAX_PRIORITY_FEE_LAMPORTS", "30000");
+    assert_eq!(Config::from_vars(exact)?.max_priority_fee_lamports, 30_000);
+
+    // Raising the cap works up to the ceiling and not a lamport beyond it.
+    let ceiling = ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS.to_string();
+    let high = with(
+        with(minimal_vars(), "MAX_PRIORITY_FEE_LAMPORTS", &ceiling),
+        "PRIORITY_FEE_MICRO_LAMPORTS",
+        "50000000",
+    );
+    let high = with(high, "COMPUTE_UNIT_LIMIT", "1000000");
+    assert_eq!(
+        Config::from_vars(high)?.max_priority_fee_lamports,
+        ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS
+    );
+    let beyond = (ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS + 1).to_string();
+    let err = err_of(Config::from_vars(with(
+        minimal_vars(),
+        "MAX_PRIORITY_FEE_LAMPORTS",
+        &beyond,
+    )))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "MAX_PRIORITY_FEE_LAMPORTS"),
+        "{err}"
+    );
     Ok(())
 }
 
@@ -571,8 +714,13 @@ fn invalid_values_are_rejected_and_blame_the_right_variable() -> TestResult {
         ("CREATOR_SOL_AMOUNT", "abc"),
         ("CREATOR_SOL_AMOUNT", "0.0000000001"),
         ("CREATOR_SOL_AMOUNT", "99999999999999999999"),
+        ("SLIPPAGE_BPS", "1001"),
+        ("SLIPPAGE_BPS", "10000"),
         ("SLIPPAGE_BPS", "10001"),
         ("SLIPPAGE_BPS", "-5"),
+        ("MAX_PRIORITY_FEE_LAMPORTS", "50000001"),
+        ("MAX_PRIORITY_FEE_LAMPORTS", "-1"),
+        ("MAX_PRIORITY_FEE_LAMPORTS", "5 sol"),
         ("SLIPPAGE_BPS", "5%"),
         ("COMPUTE_UNIT_LIMIT", "0"),
         ("COMPUTE_UNIT_LIMIT", "1400001"),

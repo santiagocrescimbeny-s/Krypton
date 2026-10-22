@@ -34,10 +34,10 @@ use krypton::builder::math::{
 use krypton::builder::pda::{self, find_pda, lookup_table_addresses};
 use krypton::builder::transaction::estimate_wire_size;
 use krypton::builder::{
-    CreateOptions, CreateVariant, LaunchAddresses, LaunchBuilder, LaunchMetadata, LaunchParams,
-    MintSigner,
+    CreateOptions, CreateVariant, FundingSnapshot, LaunchAddresses, LaunchBuilder, LaunchMetadata,
+    LaunchParams, MintSigner,
 };
-use krypton::config::Config;
+use krypton::config::{Config, ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS};
 use krypton::errors::{BuilderError, LauncherError};
 use krypton::security::SecureWallet;
 use krypton::storage::{IpfsCid, TokenMetadata, UploadedMetadata};
@@ -108,6 +108,7 @@ fn standard_params() -> Result<LaunchParams, Box<dyn Error>> {
         buy: standard_plan()?,
         compute_unit_limit: 300_000,
         priority_fee_micro_lamports: 100_000,
+        max_priority_fee_lamports: 5_000_000,
         buyback_fee_recipient: None,
     })
 }
@@ -1468,6 +1469,10 @@ fn launch_params_follow_the_runtime_configuration() -> TestResult {
         params.priority_fee_micro_lamports,
         config.priority_fee_micro_lamports
     );
+    assert_eq!(
+        params.max_priority_fee_lamports,
+        config.max_priority_fee_lamports
+    );
     assert_eq!(params.variant, CreateVariant::CreateV2);
     assert_eq!(params.options, CreateOptions::default());
     assert!(params.creator.is_none());
@@ -1546,6 +1551,273 @@ fn builder_error_messages_are_descriptive_and_value_free() {
         (
             BuilderError::EmptyField { field: "uri" },
             "token field `uri` must not be empty",
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+// =================================================================================
+// Spending guards: priority fee cap (#19), slippage bound (#20), balance (#22)
+// =================================================================================
+
+fn params_with_fee(
+    price_micro_lamports: u64,
+    compute_unit_limit: u32,
+    cap_lamports: u64,
+) -> Result<LaunchParams, Box<dyn Error>> {
+    let mut params = standard_params()?;
+    params.priority_fee_micro_lamports = price_micro_lamports;
+    params.compute_unit_limit = compute_unit_limit;
+    params.max_priority_fee_lamports = cap_lamports;
+    Ok(params)
+}
+
+fn new_builder(params: LaunchParams) -> Result<LaunchBuilder, BuilderError> {
+    LaunchBuilder::new(key(1), key(2), params)
+}
+
+#[test]
+fn builder_accepts_a_priority_fee_exactly_at_the_cap_and_refuses_one_lamport_more() -> TestResult {
+    // 5_000_000 micro-lamports x 1_000_000 CU / 1e6 = 5_000_000 lamports.
+    let at_cap = params_with_fee(5_000_000, 1_000_000, 5_000_000)?;
+    assert_eq!(at_cap.priority_fee_lamports(), 5_000_000);
+    new_builder(at_cap)?;
+
+    let over = params_with_fee(5_000_001, 1_000_000, 5_000_000)?;
+    assert_eq!(
+        err_of(new_builder(over))?,
+        BuilderError::PriorityFeeTooHigh {
+            fee_lamports: 5_000_001,
+            max: 5_000_000
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn the_absolute_ceiling_applies_even_if_the_cap_in_the_params_is_wider() -> TestResult {
+    let at_ceiling = params_with_fee(ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS, 1_000_000, u64::MAX)?;
+    new_builder(at_ceiling)?;
+
+    let beyond = params_with_fee(ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS + 1, 1_000_000, u64::MAX)?;
+    assert_eq!(
+        err_of(new_builder(beyond))?,
+        BuilderError::PriorityFeeTooHigh {
+            fee_lamports: u128::from(ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS) + 1,
+            max: ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn a_fee_wider_than_u64_is_refused_without_overflow() -> TestResult {
+    let absurd = params_with_fee(u64::MAX, u32::MAX, u64::MAX)?;
+    assert_eq!(
+        err_of(new_builder(absurd))?,
+        BuilderError::PriorityFeeTooHigh {
+            fee_lamports: 79_228_162_495_817_593_515_540,
+            max: ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn the_slippage_bound_is_shared_with_the_config_layer() -> TestResult {
+    assert_eq!(MAX_SLIPPAGE_BPS, krypton::config::MAX_SLIPPAGE_BPS);
+    assert_eq!(MAX_SLIPPAGE_BPS, 1_000);
+
+    let curve = CurveParams::default();
+    for bps in [1_001u16, 5_000, 10_000] {
+        assert_eq!(
+            err_of(BuyPlan::from_budget(&curve, 1_000_000_000, 125, bps))?,
+            BuilderError::InvalidSlippage {
+                bps,
+                max: MAX_SLIPPAGE_BPS
+            }
+        );
+    }
+    BuyPlan::from_budget(&curve, 1_000_000_000, 125, MAX_SLIPPAGE_BPS)?;
+    Ok(())
+}
+
+#[test]
+fn builder_refuses_a_hand_built_plan_with_excessive_slippage() -> TestResult {
+    let mut params = standard_params()?;
+    params.buy.slippage_bps = MAX_SLIPPAGE_BPS;
+    new_builder(params.clone())?;
+
+    params.buy.slippage_bps = MAX_SLIPPAGE_BPS + 1;
+    assert_eq!(
+        err_of(new_builder(params))?,
+        BuilderError::InvalidSlippage {
+            bps: MAX_SLIPPAGE_BPS + 1,
+            max: MAX_SLIPPAGE_BPS
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn required_balance_is_the_exact_worst_case_sum() -> TestResult {
+    let params = standard_params()?;
+    assert_eq!(params.buy.max_sol_cost_lamports, 3_192_000_000);
+    assert_eq!(params.priority_fee_lamports(), 30_000);
+
+    // 3_192_000_000 max cost + 2_074_080 Token-2022 ATA + 1_844_400 volume
+    // accumulator + 10_000 signatures + 30_000 priority + 890_880 payer reserve.
+    assert_eq!(params.required_balance(0, 0)?, 3_196_849_360);
+    // create rent (10_000_000) and the Jito tip (100_000) are added verbatim.
+    assert_eq!(params.required_balance(10_000_000, 100_000)?, 3_206_949_360);
+    Ok(())
+}
+
+#[test]
+fn the_legacy_variant_reserves_the_smaller_token_account_rent() -> TestResult {
+    let mut params = standard_params()?;
+    params.variant = CreateVariant::LegacyCreate;
+    // 2_074_080 (Token-2022 ATA) is replaced by 2_039_280 (SPL token account).
+    assert_eq!(params.required_balance(0, 0)?, 3_196_814_560);
+    Ok(())
+}
+
+#[test]
+fn required_balance_reports_overflow_instead_of_wrapping() -> TestResult {
+    let params = standard_params()?;
+    assert_eq!(
+        err_of(params.required_balance(u64::MAX, 0))?,
+        BuilderError::ArithmeticOverflow {
+            context: "required balance"
+        }
+    );
+    assert_eq!(
+        err_of(params.required_balance(0, u64::MAX))?,
+        BuilderError::ArithmeticOverflow {
+            context: "required balance"
+        }
+    );
+
+    // A fee that does not fit `u64` cannot be summed either.
+    let absurd = params_with_fee(u64::MAX, u32::MAX, u64::MAX)?;
+    assert_eq!(
+        err_of(absurd.required_balance(0, 0))?,
+        BuilderError::ArithmeticOverflow {
+            context: "priority fee"
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn ensure_funded_accepts_the_exact_requirement_and_refuses_one_lamport_less() -> TestResult {
+    let fx = fixture()?;
+    let required = fx.builder.params().required_balance(10_000_000, 100_000)?;
+    let funded = FundingSnapshot {
+        available_lamports: required,
+        create_rent_lamports: 10_000_000,
+        tip_lamports: 100_000,
+    };
+    assert_eq!(fx.builder.ensure_funded(&funded)?, required);
+
+    let short = FundingSnapshot {
+        available_lamports: required.saturating_sub(1),
+        ..funded
+    };
+    assert_eq!(
+        err_of(fx.builder.ensure_funded(&short))?,
+        BuilderError::InsufficientBalance {
+            required,
+            available: required.saturating_sub(1)
+        }
+    );
+
+    let empty = FundingSnapshot {
+        available_lamports: 0,
+        ..funded
+    };
+    assert!(matches!(
+        err_of(fx.builder.ensure_funded(&empty))?,
+        BuilderError::InsufficientBalance { available: 0, .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn the_budget_alone_is_not_enough_to_launch() -> TestResult {
+    // A wallet holding exactly the 3.04 SOL budget (or even the slippage cap)
+    // still cannot pay rent, fees and the payer reserve.
+    let fx = fixture()?;
+    let just_the_cap = FundingSnapshot {
+        available_lamports: fx.builder.params().buy.max_sol_cost_lamports,
+        create_rent_lamports: 0,
+        tip_lamports: 0,
+    };
+    assert!(matches!(
+        err_of(fx.builder.ensure_funded(&just_the_cap))?,
+        BuilderError::InsufficientBalance { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn checked_build_refuses_an_underfunded_payer_and_matches_the_plain_build_otherwise() -> TestResult
+{
+    let fx = fixture()?;
+    let required = fx.builder.params().required_balance(5_000_000, 0)?;
+    let funded = FundingSnapshot {
+        available_lamports: required,
+        create_rent_lamports: 5_000_000,
+        tip_lamports: 0,
+    };
+
+    let checked =
+        fx.builder
+            .build_signed_checked(&funded, blockhash(), &[], &[], &fx.wallet, &fx.mint)?;
+    let plain = fx
+        .builder
+        .build_signed(blockhash(), &[], &[], &fx.wallet, &fx.mint)?;
+    assert_eq!(checked.signatures, plain.signatures);
+
+    let short = FundingSnapshot {
+        available_lamports: required.saturating_sub(1),
+        ..funded
+    };
+    assert_eq!(
+        err_of(fx.builder.build_signed_checked(
+            &short,
+            blockhash(),
+            &[],
+            &[],
+            &fx.wallet,
+            &fx.mint
+        ))?,
+        BuilderError::InsufficientBalance {
+            required,
+            available: required.saturating_sub(1)
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn guard_error_messages_name_the_limits() {
+    let cases: Vec<(BuilderError, &str)> = vec![
+        (
+            BuilderError::PriorityFeeTooHigh {
+                fee_lamports: 6_000_000,
+                max: 5_000_000,
+            },
+            "priority fee of 6000000 lamports exceeds the cap of 5000000 lamports",
+        ),
+        (
+            BuilderError::InsufficientBalance {
+                required: 10,
+                available: 4,
+            },
+            "insufficient balance: 10 lamports required, 4 available",
         ),
     ];
     for (error, expected) in cases {

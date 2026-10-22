@@ -17,4 +17,4 @@ pub mod transaction;
 pub use instructions::{CreateOptions, LaunchMetadata};
 pub use math::{BuyPlan, CurveParams, DEFAULT_TOTAL_FEE_BPS};
 pub use pda::{CreateVariant, LaunchAddresses};
-pub use transaction::{CompiledLaunch, LaunchBuilder, LaunchParams, MintSigner};
+pub use transaction::{CompiledLaunch, FundingSnapshot, LaunchBuilder, LaunchParams, MintSigner};
