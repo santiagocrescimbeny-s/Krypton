@@ -13,8 +13,9 @@ use std::error::Error;
 use std::mem::ManuallyDrop;
 
 use krypton::config::{
-    priority_fee_lamports, redact_url, Config, ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS,
-    DEFAULT_COMPUTE_UNIT_LIMIT, DEFAULT_JITO_TIP_LAMPORTS, DEFAULT_MAX_PRIORITY_FEE_LAMPORTS,
+    priority_fee_lamports, redact_url, Config, ABSOLUTE_MAX_JITO_TIP_LAMPORTS,
+    ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS, DEFAULT_COMPUTE_UNIT_LIMIT, DEFAULT_JITO_TIP_LAMPORTS,
+    DEFAULT_MAX_JITO_TIP_LAMPORTS, DEFAULT_MAX_PRIORITY_FEE_LAMPORTS,
     DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS, DEFAULT_SLIPPAGE_BPS, ENV_KEYS, MAX_SLIPPAGE_BPS,
 };
 use krypton::errors::{ConfigError, LauncherError, WalletError};
@@ -413,6 +414,7 @@ fn minimal_configuration_applies_safe_defaults() -> TestResult {
         DEFAULT_MAX_PRIORITY_FEE_LAMPORTS
     );
     assert_eq!(config.jito_tip_lamports, DEFAULT_JITO_TIP_LAMPORTS);
+    assert_eq!(config.max_jito_tip_lamports, DEFAULT_MAX_JITO_TIP_LAMPORTS);
     assert!(
         config.dry_run,
         "dry-run must be ON unless explicitly disabled"
@@ -441,6 +443,7 @@ fn every_documented_variable_is_honoured() -> TestResult {
         ("PRIORITY_FEE_MICRO_LAMPORTS", "250000"),
         ("MAX_PRIORITY_FEE_LAMPORTS", "200000"),
         ("JITO_TIP_LAMPORTS", "5000000"),
+        ("MAX_JITO_TIP_LAMPORTS", "6000000"),
         ("DRY_RUN", "false"),
         ("LOG_DIR", "var/krypton-logs"),
         ("LOG_LEVEL", "debug"),
@@ -464,6 +467,7 @@ fn every_documented_variable_is_honoured() -> TestResult {
     assert_eq!(config.priority_fee_micro_lamports, 250_000);
     assert_eq!(config.max_priority_fee_lamports, 200_000);
     assert_eq!(config.jito_tip_lamports, 5_000_000);
+    assert_eq!(config.max_jito_tip_lamports, 6_000_000);
     assert!(!config.dry_run);
     assert_eq!(config.log_dir, std::path::PathBuf::from("var/krypton-logs"));
     assert_eq!(config.log_level, tracing::Level::DEBUG);
@@ -477,7 +481,7 @@ fn every_documented_variable_is_honoured() -> TestResult {
 
 #[test]
 fn env_key_list_is_complete_and_unique() {
-    assert_eq!(ENV_KEYS.len(), 15);
+    assert_eq!(ENV_KEYS.len(), 16);
     let unique: std::collections::HashSet<_> = ENV_KEYS.iter().collect();
     assert_eq!(unique.len(), ENV_KEYS.len());
 }
@@ -554,6 +558,8 @@ fn priority_fee_is_price_times_cu_limit_rounded_up() {
 }
 
 // Compile-time invariants between the limits (a violation fails the build).
+const _: () = assert!(DEFAULT_MAX_JITO_TIP_LAMPORTS <= ABSOLUTE_MAX_JITO_TIP_LAMPORTS);
+const _: () = assert!(DEFAULT_JITO_TIP_LAMPORTS <= DEFAULT_MAX_JITO_TIP_LAMPORTS);
 const _: () = assert!(DEFAULT_MAX_PRIORITY_FEE_LAMPORTS <= ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS);
 const _: () = assert!(DEFAULT_SLIPPAGE_BPS <= MAX_SLIPPAGE_BPS);
 
@@ -582,6 +588,55 @@ fn slippage_is_bounded_at_exactly_the_maximum() -> TestResult {
     );
     // A "100 % slippage" blank cheque is refused.
     assert!(Config::from_vars(with(minimal_vars(), "SLIPPAGE_BPS", "10000")).is_err());
+    Ok(())
+}
+
+#[test]
+fn the_jito_tip_is_capped_by_a_configurable_limit_with_an_absolute_ceiling() -> TestResult {
+    // Default cap: 1_000_000 lamports.
+    Config::from_vars(with(minimal_vars(), "JITO_TIP_LAMPORTS", "1000000"))?;
+    let err = err_of(Config::from_vars(with(
+        minimal_vars(),
+        "JITO_TIP_LAMPORTS",
+        "1000001",
+    )))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "JITO_TIP_LAMPORTS"),
+        "{err}"
+    );
+
+    // Raising the cap lifts the tip limit, but never beyond the ceiling.
+    let ceiling = ABSOLUTE_MAX_JITO_TIP_LAMPORTS.to_string();
+    let raised = with(
+        with(minimal_vars(), "MAX_JITO_TIP_LAMPORTS", &ceiling),
+        "JITO_TIP_LAMPORTS",
+        &ceiling,
+    );
+    assert_eq!(
+        Config::from_vars(raised)?.max_jito_tip_lamports,
+        ABSOLUTE_MAX_JITO_TIP_LAMPORTS
+    );
+    let beyond = (ABSOLUTE_MAX_JITO_TIP_LAMPORTS + 1).to_string();
+    let err = err_of(Config::from_vars(with(
+        minimal_vars(),
+        "MAX_JITO_TIP_LAMPORTS",
+        &beyond,
+    )))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "MAX_JITO_TIP_LAMPORTS"),
+        "{err}"
+    );
+
+    // A cap below the configured tip refuses the configuration.
+    let err = err_of(Config::from_vars(with(
+        minimal_vars(),
+        "MAX_JITO_TIP_LAMPORTS",
+        "99999",
+    )))?;
+    assert!(
+        matches!(&err, ConfigError::InvalidVar { name, .. } if *name == "JITO_TIP_LAMPORTS"),
+        "{err}"
+    );
     Ok(())
 }
 
@@ -719,6 +774,8 @@ fn invalid_values_are_rejected_and_blame_the_right_variable() -> TestResult {
         ("SLIPPAGE_BPS", "10001"),
         ("SLIPPAGE_BPS", "-5"),
         ("MAX_PRIORITY_FEE_LAMPORTS", "50000001"),
+        ("MAX_JITO_TIP_LAMPORTS", "10000001"),
+        ("MAX_JITO_TIP_LAMPORTS", "-1"),
         ("MAX_PRIORITY_FEE_LAMPORTS", "-1"),
         ("MAX_PRIORITY_FEE_LAMPORTS", "5 sol"),
         ("SLIPPAGE_BPS", "5%"),

@@ -62,6 +62,8 @@ pub const ENV_PRIORITY_FEE_MICRO_LAMPORTS: &str = "PRIORITY_FEE_MICRO_LAMPORTS";
 pub const ENV_MAX_PRIORITY_FEE_LAMPORTS: &str = "MAX_PRIORITY_FEE_LAMPORTS";
 /// Jito tip in lamports.
 pub const ENV_JITO_TIP_LAMPORTS: &str = "JITO_TIP_LAMPORTS";
+/// Hard ceiling on the Jito tip, in lamports (optional).
+pub const ENV_MAX_JITO_TIP_LAMPORTS: &str = "MAX_JITO_TIP_LAMPORTS";
 /// Dry-run switch.
 pub const ENV_DRY_RUN: &str = "DRY_RUN";
 /// Directory for log files.
@@ -71,7 +73,7 @@ pub const ENV_LOG_LEVEL: &str = "LOG_LEVEL";
 
 /// Every variable the configuration reads. Must stay in sync with [`RawConfig`]
 /// (its fields are renamed to these exact names).
-pub const ENV_KEYS: [&str; 15] = [
+pub const ENV_KEYS: [&str; 16] = [
     ENV_RPC_URL,
     ENV_RPC_WS_URL,
     ENV_JITO_ENGINE_URL,
@@ -84,6 +86,7 @@ pub const ENV_KEYS: [&str; 15] = [
     ENV_PRIORITY_FEE_MICRO_LAMPORTS,
     ENV_MAX_PRIORITY_FEE_LAMPORTS,
     ENV_JITO_TIP_LAMPORTS,
+    ENV_MAX_JITO_TIP_LAMPORTS,
     ENV_DRY_RUN,
     ENV_LOG_DIR,
     ENV_LOG_LEVEL,
@@ -113,6 +116,11 @@ pub const DEFAULT_MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000_000;
 pub const ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 50_000_000;
 /// Default Jito tip in lamports.
 pub const DEFAULT_JITO_TIP_LAMPORTS: u64 = 100_000;
+/// Default cap on the Jito tip: 0.001 SOL.
+pub const DEFAULT_MAX_JITO_TIP_LAMPORTS: u64 = 1_000_000;
+/// Absolute ceiling for the configurable tip cap: 0.01 SOL. No value of
+/// `MAX_JITO_TIP_LAMPORTS` can lift the cap above this.
+pub const ABSOLUTE_MAX_JITO_TIP_LAMPORTS: u64 = 10_000_000;
 /// Smallest tip the Jito Block Engine accepts for a bundle.
 pub const MIN_JITO_TIP_LAMPORTS: u64 = 1_000;
 /// Default log directory.
@@ -142,6 +150,7 @@ struct RawConfig {
     priority_fee_micro_lamports: Option<String>,
     max_priority_fee_lamports: Option<String>,
     jito_tip_lamports: Option<String>,
+    max_jito_tip_lamports: Option<String>,
     dry_run: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
@@ -175,8 +184,11 @@ pub struct Config {
     /// Hard cap on the priority fee actually paid (`price x CU limit`), in
     /// lamports. Validated against [`ABSOLUTE_MAX_PRIORITY_FEE_LAMPORTS`].
     pub max_priority_fee_lamports: u64,
-    /// Jito tip in lamports (>= 1_000).
+    /// Jito tip in lamports (`MIN_JITO_TIP_LAMPORTS..=max_jito_tip_lamports`).
     pub jito_tip_lamports: u64,
+    /// Hard cap on the Jito tip, in lamports. Validated against
+    /// [`ABSOLUTE_MAX_JITO_TIP_LAMPORTS`].
+    pub max_jito_tip_lamports: u64,
     /// When `true` nothing is ever submitted to the network.
     pub dry_run: bool,
     /// Directory where log files are written.
@@ -338,6 +350,25 @@ impl Config {
             ));
         }
 
+        let max_jito_tip_lamports = match clean(raw.max_jito_tip_lamports) {
+            Some(text) => parse_number::<u64>(ENV_MAX_JITO_TIP_LAMPORTS, &text)?,
+            None => DEFAULT_MAX_JITO_TIP_LAMPORTS,
+        };
+        if max_jito_tip_lamports > ABSOLUTE_MAX_JITO_TIP_LAMPORTS {
+            return Err(invalid(
+                ENV_MAX_JITO_TIP_LAMPORTS,
+                "must be at most 10000000 lamports (0.01 SOL)",
+            ));
+        }
+        // The tip is spent on top of the priority fee; bounding it keeps the
+        // total fee spend of a launch bounded too (audit finding #2).
+        if jito_tip_lamports > max_jito_tip_lamports {
+            return Err(invalid(
+                ENV_JITO_TIP_LAMPORTS,
+                "exceeds MAX_JITO_TIP_LAMPORTS",
+            ));
+        }
+
         let dry_run = match clean(raw.dry_run) {
             Some(text) => parse_bool(&text).ok_or_else(|| {
                 invalid(ENV_DRY_RUN, "expected true/false, 1/0, yes/no or on/off")
@@ -379,6 +410,7 @@ impl Config {
             priority_fee_micro_lamports,
             max_priority_fee_lamports,
             jito_tip_lamports,
+            max_jito_tip_lamports,
             dry_run,
             log_dir: clean(raw.log_dir)
                 .map_or_else(|| PathBuf::from(DEFAULT_LOG_DIR), PathBuf::from),
@@ -422,6 +454,7 @@ impl fmt::Debug for Config {
             )
             .field("max_priority_fee_lamports", &self.max_priority_fee_lamports)
             .field("jito_tip_lamports", &self.jito_tip_lamports)
+            .field("max_jito_tip_lamports", &self.max_jito_tip_lamports)
             .field("dry_run", &self.dry_run)
             .field("log_dir", &self.log_dir)
             .field("log_level", &self.log_level)

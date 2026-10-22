@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-22 · Base: `main` = Fases 1-3 + correcciones de las auditorías 2026-10-20/21
+Última actualización: 2026-10-22 · Base: `main` (`68c3d1e`) = Fases 1-3 + correcciones de las auditorías 2026-10-20/21; rama `phase4-jito-engine`
 
 ## Hoja de ruta
 
@@ -8,8 +8,8 @@
 |------|-------------|--------|
 | 1 | Arquitectura base, seguridad de memoria y entorno | ✅ **Completada y verificada** |
 | 2 | Motor asíncrono de metadatos (IPFS / Pinata) | ✅ **VERIFICADA** (auditoría 2026-10-20) |
-| 3 | Constructor atómico de transacciones (Create + Buy) | ✅ **Completada y verificada** (auditoría 2026-10-20 run 2) + guardas #19/#20/#22 (pendientes de re-verificar con `cargo`) |
-| 4 | Enrutamiento Jito Block Engine + simulación previa | ⬜ Pendiente |
+| 3 | Constructor atómico de transacciones (Create + Buy) | ✅ **COMPLETED & VERIFIED** (auditoría 2026-10-20 run 2; guardas #19/#20/#22 confirmadas por el propietario con 164 tests en `main`) |
+| 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | 🚧 **IN PROGRESS** — rama `phase4-jito-engine`: código y tests escritos, gates de `cargo` pendientes |
 | 5 | Monitor Yellowstone gRPC + gestor de salida | ⬜ Pendiente |
 | 6 | Harness de pruebas, `tracing` y dry-run | ⬜ Pendiente |
 
@@ -108,6 +108,41 @@ ejecutadas. **No ejecutado**: `cargo check/clippy/test` con las crates reales (c
 Recuento esperado de tests tras la fusión: 6 unitarios + 6 `env_hygiene` + 37 `phase1` + 38 `phase2` + 77 `phase3` = **164**
 (146 de la fusión + 18 de las guardas).
 
+## Fase 4 — Jito Block Engine y ALT (IN PROGRESS)
+
+Rama `phase4-jito-engine`. Código nuevo: `src/builder/alt.rs`, `src/network/jito.rs`, `JitoError` y
+`BuilderError::InvalidLookupTable` en `src/errors.rs`, `tests/phase4_tests.rs` (48 tests).
+
+| Pieza | Contenido |
+|-------|-----------|
+| `builder/alt.rs` | Instrucciones `CreateLookupTable` / `ExtendLookupTable` codificadas a mano (el SDK 4.1 no las trae), derivación de la dirección de la tabla, decodificador de la cuenta (cabecera de 56 bytes), `launch_table_setup` y `LaunchLookupTable` (tabla comprobada: activa, "caliente" y con las 14 direcciones estáticas) |
+| `builder/transaction.rs` | `LaunchBuilder::compile_with_table` (905 B sin tip), `payer()` |
+| `network/jito.rs` | `JitoClient` (JSON-RPC sobre `reqwest` + rustls: `getTipAccounts`, `sendBundle` en base64, `getInflightBundleStatuses`), `build_jito_tip_instruction`, `JitoTip`, `assemble_launch_transaction`, `serialize_transaction`, `encode_base64`, `BundleId`, las 8 cuentas de tip oficiales |
+| Config | `MAX_JITO_TIP_LAMPORTS` (por defecto 1 000 000; techo absoluto 10 000 000): `JITO_TIP_LAMPORTS` por encima del tope impide arrancar |
+
+Decisiones y garantías:
+
+- **JSON-RPC, no gRPC.** El gRPC del Block Engine exigiría `tonic`/`prost` y protobufs generados, y no se pueden añadir
+  crates sin acceso a crates.io (el `Cargo.lock` se edita a mano). `base64` se implementa localmente (vectores RFC 4648 en los tests).
+- **El tip nunca va en la ALT** (regla explícita de Jito): la cuenta de tip y el System program quedan como claves estáticas.
+  Tamaño esperado con tip: 905 B + ~80 B ≈ 985 B < 1232 B; los tests exigen margen ≥ 200 B.
+- **Tope del tip y presupuesto.** `JitoTip` solo se construye entre 1000 lamports y `min(MAX_JITO_TIP_LAMPORTS, techo)`;
+  `assemble_launch_transaction` suma el tip al `required_balance` y ejecuta `ensure_funded` antes de compilar o firmar.
+  El priority fee conserva su tope (#19) en `LaunchBuilder::new`.
+- **Dry-run en la capa más baja:** con `DRY_RUN=true`, `JitoClient::send_bundle` devuelve `JitoError::DryRun` sin tocar la red.
+- `sendBundle` **no se reintenta** (ante un timeout hay que consultar el estado); las lecturas sí, con backoff y pausa mínima de 1 s tras un 429.
+- Endpoints solo HTTPS (HTTP solo a loopback), sin credenciales/query en la URL, redirecciones desactivadas, respuesta acotada a 64 KiB,
+  texto remoto saneado.
+
+Pendiente de la Fase 4 (fuera de esta entrega): simulación previa vía RPC `simulateTransaction` para medir el rent de `Create`,
+lectura viva de `Global`/`fee_config` (#21), envío real tras `DRY_RUN=false`, seguimiento del bundle hasta `Landed`.
+
+Verificación de esta entrega: `rustfmt --check` limpio; `alt.rs` y el builder compilados con `rustc` y pasados por
+`clippy-driver -D warnings` contra *mocks* de Solana con comprobaciones de comportamiento; las funciones puras de `jito.rs`
+(base64, tip, `BundleId`, short_vec) compiladas y ejecutadas aparte. **No ejecutado**: `cargo check/clippy/test` con las crates
+reales (crates.io bloqueado en el sandbox), por lo que el cliente HTTP (`reqwest`/`serde`) y `tests/phase4_tests.rs` están sin compilar.
+Recuento esperado: 6 unitarios + 6 `env_hygiene` + 38 `phase1` + 38 `phase2` + 77 `phase3` + 48 `phase4` = **213**.
+
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 
 Verificadas por la auditoría `claude/audit-2026-10-20-run2.md` sobre `350e404` (check, clippy `-D warnings`,
@@ -134,7 +169,7 @@ Detalle en `claude/audit-2026-10-17.md`, `claude/audit-2026-10-17-run2.md` y
 `claude/audit-2026-10-19.md`, `claude/audit-2026-10-20.md`, `claude/audit-2026-10-20-run2.md` y `claude/audit-2026-10-21.md`.
 
 - [x] #1 `Config` retiene la clave como string → guarda solo `SecureWallet` (cerrado, auditoría run 2)
-- [ ] #2 topes de gasto total → parcialmente cubierto: priority fee (#19), slippage (#20) y saldo requerido (#22); falta tope del tip de Jito (Fase 4)
+- [x] #2 topes de gasto: priority fee (#19), slippage (#20), saldo requerido (#22) y tope del tip de Jito (`MAX_JITO_TIP_LAMPORTS`, Fase 4; pendiente de re-verificar con `cargo`)
 - [x] #3 slippage acotado + matemática u128 → `builder::math` (checked) + cota de 10 %
 - [x] #4 limpiar `PRIVATE_KEY` del entorno tras leerla (cerrado)
 - [ ] #5–#10 hallazgos Low/Info (`Debug` de wallet, saneado de `Rpc.message`, lints aritméticos, deps sin uso, copias en stack, `redact_url`)

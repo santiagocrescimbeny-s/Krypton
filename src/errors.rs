@@ -47,6 +47,10 @@ pub enum LauncherError {
     #[error("transaction builder error: {0}")]
     Builder(#[from] BuilderError),
 
+    /// Jito Block Engine failure (tip, bundle submission, status queries).
+    #[error("Jito error: {0}")]
+    Jito(#[from] JitoError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -308,6 +312,142 @@ pub fn sanitize_remote_message(raw: &str) -> String {
     joined.chars().take(MAX_REMOTE_MESSAGE_CHARS).collect()
 }
 
+/// Failures of the Jito Block Engine client and of the tip / bundle assembly.
+///
+/// Variants carry only static labels, numbers and sanitized remote text (see
+/// [`sanitize_remote_message`]); never keys, URLs or raw response bodies.
+#[derive(Debug, Error)]
+pub enum JitoError {
+    /// The engine URL is unusable.
+    #[error("invalid Jito endpoint: {reason}")]
+    InvalidEndpoint {
+        /// Value-free explanation.
+        reason: String,
+    },
+
+    /// The HTTP client could not be constructed.
+    #[error("failed to build the HTTP client: {0}")]
+    ClientBuild(#[source] reqwest::Error),
+
+    /// `DRY_RUN` is enabled: nothing is submitted to the network.
+    #[error("dry-run mode is active: the bundle was not submitted")]
+    DryRun,
+
+    /// A bundle needs at least one transaction.
+    #[error("a bundle must contain at least one transaction")]
+    EmptyBundle,
+
+    /// Jito accepts at most five transactions per bundle.
+    #[error("a bundle holds {count} transactions, above the limit of {max}")]
+    BundleTooLarge {
+        /// Transactions supplied.
+        count: usize,
+        /// Maximum accepted.
+        max: usize,
+    },
+
+    /// The tip is below the Block Engine minimum.
+    #[error("tip of {lamports} lamports is below the minimum of {min} lamports")]
+    TipTooLow {
+        /// Requested tip.
+        lamports: u64,
+        /// Minimum accepted tip.
+        min: u64,
+    },
+
+    /// The tip is above the configured cap (or the absolute ceiling).
+    #[error("tip of {lamports} lamports exceeds the cap of {max} lamports")]
+    TipTooHigh {
+        /// Requested tip.
+        lamports: u64,
+        /// Effective cap.
+        max: u64,
+    },
+
+    /// A transaction in the bundle does not fit a packet.
+    #[error("transaction is {size} bytes, above the {max} byte packet limit")]
+    TransactionTooLarge {
+        /// Serialized size.
+        size: usize,
+        /// Packet limit.
+        max: usize,
+    },
+
+    /// The Block Engine rejected the request rate (HTTP 429).
+    #[error("the Block Engine is rate limiting this client (HTTP 429)")]
+    RateLimited,
+
+    /// The Block Engine rejected the credentials (HTTP 401/403).
+    #[error("the Block Engine rejected the request (HTTP {status})")]
+    Unauthorized {
+        /// HTTP status code received.
+        status: u16,
+    },
+
+    /// A non-success HTTP status without a JSON-RPC error body.
+    #[error("the Block Engine returned HTTP {status}: {message}")]
+    Api {
+        /// HTTP status code received.
+        status: u16,
+        /// Remote text, sanitized.
+        message: String,
+    },
+
+    /// A JSON-RPC error object.
+    #[error("the Block Engine returned JSON-RPC error {code}: {message}")]
+    Rpc {
+        /// JSON-RPC error code.
+        code: i64,
+        /// Remote text, sanitized.
+        message: String,
+    },
+
+    /// Connection-level failure (DNS, TCP, TLS, reset, ...).
+    #[error("transport error while talking to the Block Engine: {0}")]
+    Transport(#[source] reqwest::Error),
+
+    /// The Block Engine did not answer within the deadline.
+    #[error("the Block Engine did not answer within the deadline")]
+    Timeout,
+
+    /// The response was not the expected JSON-RPC document.
+    #[error("unexpected response from the Block Engine: {0}")]
+    InvalidResponse(&'static str),
+
+    /// Every attempt of a read-only call failed with a transient error.
+    #[error("request failed after {attempts} attempts: {source}")]
+    RetriesExhausted {
+        /// Number of attempts performed.
+        attempts: u32,
+        /// The error of the last attempt.
+        #[source]
+        source: Box<JitoError>,
+    },
+
+    /// The launch transaction could not be assembled.
+    #[error("transaction builder error: {0}")]
+    Builder(#[from] BuilderError),
+}
+
+impl JitoError {
+    /// `true` for transient failures worth retrying on a read-only call:
+    /// timeouts, connection-level errors, HTTP 429, 408, 425 and 5xx.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Timeout | Self::RateLimited => true,
+            Self::Transport(source) => {
+                !(source.is_builder()
+                    || source.is_redirect()
+                    || source.is_status()
+                    || source.is_decode())
+            }
+            Self::Api { status, .. } => matches!(*status, 408 | 425 | 500..=599),
+            _ => false,
+        }
+    }
+}
+
 /// Failures while deriving addresses, encoding instructions, or assembling and
 /// signing the atomic `Create` + `Buy` transaction.
 ///
@@ -404,6 +544,14 @@ pub enum BuilderError {
     /// The `v0` message could not be compiled.
     #[error("failed to compile the v0 message: {0}")]
     MessageCompile(String),
+
+    /// An Address Lookup Table is malformed, inactive or does not hold the
+    /// addresses the launch needs.
+    #[error("invalid address lookup table: {reason}")]
+    InvalidLookupTable {
+        /// Static, value-free explanation.
+        reason: &'static str,
+    },
 
     /// The priority fee (`price x compute unit limit`) is above the configured cap.
     #[error("priority fee of {fee_lamports} lamports exceeds the cap of {max} lamports")]

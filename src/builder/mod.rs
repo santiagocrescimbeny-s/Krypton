@@ -6,14 +6,18 @@
 //!   bonding curve, Metaplex metadata, mint authority, ...).
 //! - [`math`]: exact constant-product math for the creator's initial buy.
 //! - [`instructions`]: byte-exact instruction encoding.
-//! - [`transaction`]: message compilation, size control and signing.
+//! - [`transaction`]: message compilation, size control and signing;
+//! - [`alt`]: Address Lookup Table instructions, decoding and the checked
+//!   [`LaunchLookupTable`] handle.
 
+pub mod alt;
 pub mod constants;
 pub mod instructions;
 pub mod math;
 pub mod pda;
 pub mod transaction;
 
+pub use alt::LaunchLookupTable;
 pub use instructions::{CreateOptions, LaunchMetadata};
 pub use math::{BuyPlan, CurveParams, DEFAULT_TOTAL_FEE_BPS};
 pub use pda::{CreateVariant, LaunchAddresses};

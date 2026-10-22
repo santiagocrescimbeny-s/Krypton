@@ -28,6 +28,7 @@ use solana_sdk::message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::transaction::VersionedTransaction;
 use zeroize::Zeroizing;
 
+use super::alt::LaunchLookupTable;
 use super::constants::{
     select_buyback_fee_recipient, BASE_SIGNATURE_FEE_LAMPORTS, LAUNCH_SIGNATURE_COUNT,
     MAX_TRANSACTION_SIZE, PAYER_RENT_EXEMPT_RESERVE_LAMPORTS, TOKEN_ACCOUNT_RENT_2022_LAMPORTS,
@@ -330,6 +331,12 @@ impl LaunchBuilder {
         })
     }
 
+    /// The fee payer (also the buyer and, by default, the creator).
+    #[must_use]
+    pub fn payer(&self) -> Pubkey {
+        self.payer
+    }
+
     /// All derived addresses of this launch.
     #[must_use]
     pub fn addresses(&self) -> &LaunchAddresses {
@@ -413,6 +420,29 @@ impl LaunchBuilder {
             });
         }
         Ok(CompiledLaunch { message, wire_size })
+    }
+
+    /// [`LaunchBuilder::compile`] with the launch's Address Lookup Table.
+    ///
+    /// The table is a [`LaunchLookupTable`], i.e. one already checked to hold
+    /// every static launch address, so the result is the compact form (about 905
+    /// bytes without a tip instead of 1212), which is what leaves room for the
+    /// Jito tip appended through `trailing`. Tip accounts must stay **out** of
+    /// the table (see [`super::alt`]).
+    ///
+    /// # Errors
+    /// See [`LaunchBuilder::compile`].
+    pub fn compile_with_table(
+        &self,
+        recent_blockhash: Hash,
+        table: &LaunchLookupTable,
+        trailing: &[Instruction],
+    ) -> Result<CompiledLaunch, BuilderError> {
+        self.compile(
+            recent_blockhash,
+            std::slice::from_ref(&table.to_account()),
+            trailing,
+        )
     }
 
     /// Signs a compiled message with the wallet and the mint keypair.

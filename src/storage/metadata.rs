@@ -706,7 +706,7 @@ fn config_error(name: &'static str, err: &IpfsError) -> ConfigError {
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }

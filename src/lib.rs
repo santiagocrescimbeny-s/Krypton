@@ -6,7 +6,9 @@
 //! - [`config`]: strongly-typed configuration loaded from the environment.
 //! - [`parsing`]: dependency-free, allocation-light parsing helpers.
 //!
-//! The remaining modules are empty scaffolding that later phases fill in.
+//! Later phases add [`storage`] (Pinata/IPFS metadata), [`builder`] (atomic
+//! `Create` + `Buy` transaction, lookup tables) and [`network`] (Jito Block
+//! Engine client and tip). [`monitor`] is scaffolding for Phase 5.
 
 #![forbid(unsafe_code)]
 // Zero Panics Policy: enforced by the compiler for all non-test code.

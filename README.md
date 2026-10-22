@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-3 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito) pendiente. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-3 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) en curso en `phase4-jito-engine`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
@@ -19,10 +19,13 @@ src/
     wallet.rs              SecureWallet + SecretKeyBytes (ZeroizeOnDrop)
   storage/metadata.rs      cliente Pinata/IPFS: imagen + JSON Metaplex/Pump.fun -> metadata_uri
   builder/                 Fase 3: constants, pda, math, instructions, transaction (Create + Buy atómico)
-  network/ monitor/        andamiaje para las fases 4-5
+    alt.rs                 Fase 4: Address Lookup Table (crear/extender/decodificar, LaunchLookupTable)
+  network/jito.rs          Fase 4: cliente JSON-RPC del Block Engine, tip, ensamblado del bundle
+  monitor/                 andamiaje para la fase 5
 tests/phase1_tests.rs      pruebas de wallet, zeroize y configuración
 tests/phase2_tests.rs      pruebas del motor de metadatos (servidor HTTP simulado)
 tests/phase3_tests.rs      pruebas de PDAs, curva, instrucciones, transacción y guardas de gasto
+tests/phase4_tests.rs      pruebas de ALT, tip de Jito, tamaño de la tx y cliente (servidor HTTP simulado)
 tests/env_hygiene_tests.rs higiene del entorno (.env explícito, PRIVATE_KEY limpiada)
 tests/common/mod.rs        servidor HTTP de pruebas (solo std)
 ```
@@ -50,6 +53,7 @@ Topes de gasto (validados al arrancar y de nuevo en el constructor):
 - `SLIPPAGE_BPS` ≤ 1000 (10 %).
 - `PRIORITY_FEE_MICRO_LAMPORTS × COMPUTE_UNIT_LIMIT / 1e6` ≤ `MAX_PRIORITY_FEE_LAMPORTS`
   (por defecto 5 000 000 lamports; techo absoluto 50 000 000).
+- `JITO_TIP_LAMPORTS` ≤ `MAX_JITO_TIP_LAMPORTS` (por defecto 1 000 000 lamports; techo absoluto 10 000 000).
 - Antes de ensamblar la transacción, `LaunchBuilder::ensure_funded` / `build_signed_checked` exigen
   que el pagador tenga el coste máximo (`LaunchParams::required_balance`).
 
