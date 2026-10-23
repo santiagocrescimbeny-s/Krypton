@@ -9,8 +9,8 @@
 //! The wallet key is parsed once, during validation, into a zeroizing
 //! [`SecureWallet`]; the original string ([`SecretString`]) is wiped as soon as
 //! parsing finishes, so [`Config`] never retains the textual key. In addition,
-//! [`Config::from_env`] removes `PRIVATE_KEY` from the process environment right
-//! after reading it.
+//! [`Config::from_env`] removes `PRIVATE_KEY` and `YELLOWSTONE_X_TOKEN` from the
+//! process environment right after reading them.
 //!
 //! # `.env` discovery
 //! Only an explicit path is ever read ([`DEFAULT_DOTENV_PATH`] for
@@ -38,6 +38,11 @@ use crate::execution::settings::{
     ENV_LIVE_TRADING, ENV_MAX_SOL_PER_TX,
 };
 use crate::parsing::{parse_bool, parse_sol_to_lamports};
+use crate::production::{
+    merge_alias, ProductionSettings, RawProductionSettings, ENV_JITO_BLOCK_ENGINE_URL,
+    ENV_JITO_TIP_STREAM_URL, ENV_PAYER_KEYPAIR_PATH, ENV_YELLOWSTONE_ENDPOINT,
+    ENV_YELLOWSTONE_X_TOKEN,
+};
 use crate::security::{SecretString, SecureWallet};
 
 // --- Environment variable names ------------------------------------------------
@@ -75,8 +80,11 @@ pub const ENV_LOG_DIR: &str = "LOG_DIR";
 /// Minimum log level.
 pub const ENV_LOG_LEVEL: &str = "LOG_LEVEL";
 
-/// Every variable the configuration reads. Must stay in sync with [`RawConfig`]
-/// (its fields are renamed to these exact names).
+/// The core variables of the configuration (Phases 1-7). Together with
+/// [`PRODUCTION_ENV_KEYS`] they are every variable the configuration reads, and
+/// must stay in sync with [`RawConfig`] (its fields are renamed to these exact
+/// names). The two lists are kept apart so that the production bridge adds
+/// variables without changing this one.
 pub const ENV_KEYS: [&str; 21] = [
     ENV_RPC_URL,
     ENV_RPC_WS_URL,
@@ -99,6 +107,17 @@ pub const ENV_KEYS: [&str; 21] = [
     ENV_LIVE_KEYPAIR_PATH,
     ENV_MAX_SOL_PER_TX,
     ENV_DAILY_DRAWDOWN_SOL,
+];
+
+/// The production-bridge variables (see [`crate::production`]): all optional.
+/// `PAYER_KEYPAIR_PATH` and `JITO_BLOCK_ENGINE_URL` are aliases of
+/// `LIVE_KEYPAIR_PATH` and `JITO_ENGINE_URL`.
+pub const PRODUCTION_ENV_KEYS: [&str; 5] = [
+    ENV_YELLOWSTONE_ENDPOINT,
+    ENV_YELLOWSTONE_X_TOKEN,
+    ENV_JITO_BLOCK_ENGINE_URL,
+    ENV_JITO_TIP_STREAM_URL,
+    ENV_PAYER_KEYPAIR_PATH,
 ];
 
 // --- Defaults and limits -------------------------------------------------------
@@ -168,6 +187,11 @@ struct RawConfig {
     live_keypair_path: Option<String>,
     max_sol_per_tx: Option<String>,
     daily_drawdown_sol: Option<String>,
+    yellowstone_endpoint: Option<String>,
+    yellowstone_x_token: Option<SecretString>,
+    jito_block_engine_url: Option<String>,
+    jito_tip_stream_url: Option<String>,
+    payer_keypair_path: Option<String>,
 }
 
 // --- Validated configuration ---------------------------------------------------
@@ -212,6 +236,8 @@ pub struct Config {
     /// Live-trading opt-in and capital limits (Phase 7). Inert unless
     /// [`crate::execution::live::LiveExecutor::arm`] accepts it.
     pub live: LiveSettings,
+    /// Yellowstone endpoint and tip-feed URL (production bridge). All optional.
+    pub production: ProductionSettings,
     /// The parsed wallet. The textual key is not kept (see the module docs).
     wallet: SecureWallet,
 }
@@ -269,8 +295,8 @@ impl Config {
     /// [`ConfigError::MissingVar`] for absent required keys,
     /// [`ConfigError::InvalidVar`] for malformed or out-of-range values.
     pub fn from_vars(mut vars: HashMap<String, String>) -> Result<Self, ConfigError> {
-        let mut object = serde_json::Map::with_capacity(ENV_KEYS.len());
-        for key in ENV_KEYS {
+        let mut object = serde_json::Map::with_capacity(ENV_KEYS.len() + PRODUCTION_ENV_KEYS.len());
+        for key in ENV_KEYS.into_iter().chain(PRODUCTION_ENV_KEYS) {
             if let Some(value) = vars.remove(key) {
                 object.insert(key.to_owned(), serde_json::Value::String(value));
             }
@@ -283,7 +309,15 @@ impl Config {
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
         // Required values first, in a fixed order, so errors are deterministic.
         let rpc_url = require(ENV_RPC_URL, clean(raw.rpc_url))?;
-        let jito_engine_url = require(ENV_JITO_ENGINE_URL, clean(raw.jito_engine_url))?;
+        let jito_engine_url = require(
+            ENV_JITO_ENGINE_URL,
+            merge_alias(
+                ENV_JITO_ENGINE_URL,
+                ENV_JITO_BLOCK_ENGINE_URL,
+                raw.jito_engine_url,
+                raw.jito_block_engine_url,
+            )?,
+        )?;
         let private_key =
             raw.private_key
                 .filter(|secret| !secret.is_blank())
@@ -416,9 +450,19 @@ impl Config {
         let live = LiveSettings::from_raw(RawLiveSettings {
             live_trading: raw.live_trading,
             live_confirm: raw.live_confirm,
-            live_keypair_path: raw.live_keypair_path,
+            live_keypair_path: merge_alias(
+                ENV_LIVE_KEYPAIR_PATH,
+                ENV_PAYER_KEYPAIR_PATH,
+                raw.live_keypair_path,
+                raw.payer_keypair_path,
+            )?,
             max_sol_per_tx: raw.max_sol_per_tx,
             daily_drawdown_sol: raw.daily_drawdown_sol,
+        })?;
+        let production = ProductionSettings::from_raw(RawProductionSettings {
+            yellowstone_endpoint: raw.yellowstone_endpoint,
+            yellowstone_x_token: raw.yellowstone_x_token,
+            jito_tip_stream_url: raw.jito_tip_stream_url,
         })?;
 
         Ok(Self {
@@ -441,6 +485,7 @@ impl Config {
                 .map_or_else(|| PathBuf::from(DEFAULT_LOG_DIR), PathBuf::from),
             log_level,
             live,
+            production,
             wallet,
         })
     }
@@ -485,6 +530,7 @@ impl fmt::Debug for Config {
             .field("log_dir", &self.log_dir)
             .field("log_level", &self.log_level)
             .field("live", &self.live)
+            .field("production", &self.production)
             .field("private_key", &"<redacted>")
             .finish()
     }
@@ -526,7 +572,7 @@ fn load_dotenv(path: &Path) -> Result<(), ConfigError> {
 /// Snapshots the recognised variables from the process environment.
 fn collect_env_vars() -> Result<HashMap<String, String>, ConfigError> {
     let mut vars = HashMap::with_capacity(ENV_KEYS.len());
-    for key in ENV_KEYS {
+    for key in ENV_KEYS.into_iter().chain(PRODUCTION_ENV_KEYS) {
         match std::env::var(key) {
             Ok(value) => {
                 vars.insert(key.to_owned(), value);
@@ -543,9 +589,11 @@ fn collect_env_vars() -> Result<HashMap<String, String>, ConfigError> {
     Ok(vars)
 }
 
-/// Removes the wallet key from the process environment.
+/// Removes the wallet key and the Yellowstone token from the process
+/// environment.
 fn scrub_secret_env() {
     std::env::remove_var(ENV_PRIVATE_KEY);
+    std::env::remove_var(ENV_YELLOWSTONE_X_TOKEN);
 }
 
 /// Maps a `dotenvy` error to a variant that cannot leak file contents

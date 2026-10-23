@@ -17,6 +17,11 @@
 //! Phase 7 adds [`execution`]: the dry-to-live barrier, the spending guards, the
 //! dynamic Jito tip and the live executor.
 //!
+//! The production bridge adds [`production`] (Yellowstone/Jito endpoints and the
+//! `PAYER_KEYPAIR_PATH` alias), [`app`] (command line, the process-level
+//! dry-to-live barrier, blockhash refresher, services) and [`runner`] (the
+//! sessions the `krypton` binary runs).
+//!
 //! Phase 6 adds [`simulation`] (a network-free dry-run of the whole token
 //! lifecycle with deterministic stress injection) and [`metrics`] (zero-allocation
 //! microsecond latency tracking from stream ingestion to transaction assembly).
@@ -35,6 +40,7 @@
     )
 )]
 
+pub mod app;
 pub mod builder;
 pub mod config;
 pub mod errors;
@@ -44,6 +50,8 @@ pub mod metrics;
 pub mod monitor;
 pub mod network;
 pub mod parsing;
+pub mod production;
+pub mod runner;
 pub mod security;
 pub mod simulation;
 pub mod storage;

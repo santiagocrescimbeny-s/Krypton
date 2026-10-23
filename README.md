@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) completada y verificada en `main`; Fase 8 (adaptador Yellowstone gRPC y feed de tips de Jito) en curso en `phase8-yellowstone-adapter` (falta el enlace `tonic`). Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) completada y verificada en `main`; Fase 8 (adaptador Yellowstone gRPC y feed de tips de Jito) completada y verificada en `main` (el enlace `tonic` queda tras la *feature* `grpc`); el puente de producción (binario `krypton`) está en revisión en `mainnet-production-bridge`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
@@ -21,7 +21,13 @@ src/
   builder/                 Fase 3: constants, pda, math, instructions, transaction (Create + Buy atómico)
     alt.rs                 Fase 4: Address Lookup Table (crear/extender/decodificar, LaunchLookupTable)
   network/jito.rs          Fase 4: cliente JSON-RPC del Block Engine, tip, ensamblado del bundle
-  network/yellowstone.rs   Fase 8: adaptador Yellowstone (StreamTransport, conversión de mensajes, ping/pong, clasificación gRPC); falta el enlace tonic
+  network/yellowstone.rs   Fase 8: adaptador Yellowstone (StreamTransport, conversión de mensajes, ping/pong, clasificación gRPC)
+  network/grpc.rs          Puente: enlace `tonic` (solo con `--features grpc`; referencia SIN compilar, ver docs/yellowstone-adapter.md)
+  network/rpc.rs           Puente: fuente de blockhash por JSON-RPC (`getLatestBlockhash`)
+  production.rs            Puente: YELLOWSTONE_*, JITO_TIP_STREAM_URL y alias (JITO_BLOCK_ENGINE_URL, PAYER_KEYPAIR_PATH)
+  app.rs                   Puente: CLI, barrera dry→live del proceso, preflight 0600, refresco de blockhash, servicios
+  runner.rs                Puente: `check` y la sesión de salida (`run_exit` + actualizador de `TipBook`)
+  main.rs                  Puente: binario `krypton` (config → logging → barrera → sesión)
   monitor/                 Fase 5: geyser (supervisor del stream), curve, exit (motor de salida por tramos), submit (Jito)
   builder/sell.rs          Fase 5: SellBuilder (sell_v3 firmado)
   docs/yellowstone-adapter.md  Contrato del adaptador gRPC de Yellowstone
@@ -39,6 +45,8 @@ tests/phase8_tests.rs      pruebas del adaptador Yellowstone (conexiones simulad
 tests/phase8_http_tests.rs pruebas del parser y la fuente HTTP del feed de tips (servidor HTTP local)
 tests/phase7_tests.rs      pruebas de la barrera dry→live, las guardas de capital, el tip dinámico y el LiveExecutor (Block Engine simulado, sin red)
 tests/env_hygiene_tests.rs higiene del entorno (.env explícito, PRIVATE_KEY limpiada)
+tests/bridge_tests.rs      pruebas del puente: CLI, barrera dry→live, preflight 0600, refresco de blockhash, servicios y una sesión dry completa (sin red)
+tests/bridge_config_tests.rs pruebas del puente con `Config`/`reqwest` reales: variables nuevas, alias, limpieza del token, parser de blockhash
 tests/common/mod.rs        servidor HTTP de pruebas (solo std)
 ```
 
@@ -83,10 +91,31 @@ explícitamente.
 |----------|-----------|
 | `DRY_RUN` | `false` (con `LIVE_TRADING=true` y `DRY_RUN=true` → `LiveError::DryRunEnabled`) |
 | `LIVE_TRADING` | `true` |
-| `LIVE_CONFIRM` | exactamente `i-understand-real-funds-will-be-spent` |
+| `LIVE_CONFIRM` | exactamente `I-UNDERSTAND-REAL-FUNDS-WILL-BE-SPENT` (en mayúsculas) |
 | `LIVE_KEYPAIR_PATH` | archivo regular (no *symlink*), modo `600` en Unix, ≤ 4 KiB; su clave pública debe coincidir con `PRIVATE_KEY` |
 | `MAX_SOL_PER_TX` | > 0 y ≤ 10 SOL (tope por transacción) |
 | `DAILY_DRAWDOWN_SOL` | ≥ `MAX_SOL_PER_TX` y ≤ 50 SOL (límite diario neto) |
 
 Además, `SLIPPAGE_BPS` ≤ 1000 (10 %) se vuelve a comprobar en la barrera, y el tip dinámico nunca supera `MAX_JITO_TIP_LAMPORTS`.
 `ENV_KEYS` pasa de 16 a 21 claves. Los mensajes de error no incluyen rutas ni valores.
+
+### Puente de producción: el binario `krypton`
+
+```bash
+cargo run --release -- check                      # valida configuración, archivo de clave (0600) y endpoints; sin red
+cargo run --release -- exit --mint <MINT> --tokens <UNIDADES> \
+    --entry-sol-reserves <LAMPORTS> --entry-token-reserves <UNIDADES>   # ensayo (dry): nada sale del proceso
+```
+
+Variables nuevas (todas opcionales; ver `.env.example`): `YELLOWSTONE_ENDPOINT`, `YELLOWSTONE_X_TOKEN` (se elimina del entorno al leerla),
+`JITO_BLOCK_ENGINE_URL` (alias de `JITO_ENGINE_URL`), `JITO_TIP_STREAM_URL` (URL **HTTP** del `tip_floor`; un WebSocket se rechaza) y
+`PAYER_KEYPAIR_PATH` (alias de `LIVE_KEYPAIR_PATH`). Con dos nombres a la vez deben coincidir; si no, error. `ENV_KEYS` sigue en 21; las
+cinco nuevas están en `PRODUCTION_ENV_KEYS`.
+
+**Barrera dry→live del proceso.** Sin `--live` el binario *siempre* corre en seco, aunque el entorno esté armado. Para gastar fondos reales hace falta
+a la vez: `--live --confirm-live I-UNDERSTAND-REAL-FUNDS-WILL-BE-SPENT`, `DRY_RUN=false`, `LIVE_TRADING=true`, `LIVE_CONFIRM` con la misma frase,
+`MAX_SOL_PER_TX`, `DAILY_DRAWDOWN_SOL` y un archivo de clave (`PAYER_KEYPAIR_PATH`) regular, no *symlink*, de modo `0600` en Unix, cuya clave pública
+coincida con `PRIVATE_KEY`. `LiveExecutor::arm` repite todas las comprobaciones. `krypton check --live --confirm-live …` cruza la barrera sin conectar a nada.
+
+`exit` necesita `YELLOWSTONE_ENDPOINT` y una compilación con `--features grpc` (ver `docs/yellowstone-adapter.md`); sin ella se niega a arrancar.
+Códigos de salida: `0` bien, `1` error, `2` error de línea de comandos, `3` terminó con órdenes de resultado desconocido (revisa la cuenta de tokens antes de seguir).

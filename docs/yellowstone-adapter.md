@@ -3,10 +3,13 @@
 `src/monitor/geyser.rs` contains the whole supervision logic of the stream
 monitor (reconnection with exponential backoff and jitter, idle watchdog, health
 reporting, graceful shutdown, stale-update filtering) behind two small traits.
-The network transport itself is **not** part of this crate yet, because a
-Yellowstone client needs `tonic`, `prost` and the generated protobufs, none of
-which are in `Cargo.lock`, and the dependency set may only change where crates.io
-is reachable. This document specifies the adapter that closes the gap.
+The `tonic` link is **not compiled by default**: a Yellowstone client needs
+`tonic`, `prost` and the generated protobufs, none of which are in `Cargo.lock`, and
+the dependency set may only change where crates.io is reachable. The adapter core
+(`network/yellowstone.rs`) is complete and tested, and the link itself is written as a
+reference binding in `src/network/grpc.rs` behind the `grpc` cargo feature (see
+[Enabling the link](#enabling-the-link-production-bridge)). This document specifies
+the contract it implements.
 
 ## Contract
 
@@ -139,3 +142,30 @@ pub trait YellowstoneSession: Send {
 credentials, valid port) and the token. Its `Debug` prints the origin (`scheme://host:port`) and
 whether a token is set; providers often put an access token in the URL path, so log
 `settings.origin()`, never `settings.endpoint()`.
+
+## Enabling the link (production bridge)
+
+`src/network/grpc.rs` (`TonicLink`, `subscribe_request`, `convert_update`) implements the
+checklist above. It was written from this document **without ever being compiled**
+(crates.io was unreachable), so expect to fix small API differences the first time. The
+`grpc` feature in `Cargo.toml` declares no dependencies, which keeps `Cargo.lock` and the
+default build (the three gates) untouched. On a machine that reaches crates.io:
+
+1. `cargo add yellowstone-grpc-proto tonic tokio-stream` (pick versions that share one
+   `tonic`; give `tonic` a TLS-roots feature such as `tls-native-roots`, and
+   `yellowstone-grpc-proto` the feature that exposes `geyser::geyser_client`);
+2. `cargo update -w`, review and commit the `Cargo.lock` diff, run `cargo audit`;
+3. `cargo check --all-targets --locked --features grpc`, then the clippy and test gates with
+   `--features grpc`. Typical fixes: the TLS-roots call in `TonicLink::open`, field names of
+   the generated messages, `tokio-stream` re-exports;
+4. `cargo run --release --features grpc -- check`, then a **dry** `exit` against a real
+   endpoint: curve account update, server ping, forced drop (cut the network for a few
+   seconds and watch the reconnection). Do not go live before this passes.
+
+`runner.rs` selects the link with `cfg(feature = "grpc")`; in a default build it uses
+`UnavailableLink` (it type-checks the whole pipeline but never connects), and `krypton exit`
+refuses to start with a clear error.
+
+Two limits worth knowing: `tonic` keeps its own copy of the `x-token` header value for the
+life of the channel, and that copy is not zeroized; and the default decoding limit of 4 MiB
+is far above any message this subscription produces (a bonding curve is 166 bytes).

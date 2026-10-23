@@ -75,6 +75,14 @@ pub enum LauncherError {
     #[error("yellowstone error: {0}")]
     Yellowstone(#[from] YellowstoneError),
 
+    /// Command-line failure.
+    #[error("command line error: {0}")]
+    Cli(#[from] CliError),
+
+    /// Production bridge failure (barrier, blockhash source, services).
+    #[error("bridge error: {0}")]
+    Bridge(#[from] BridgeError),
+
     /// Jito tip-floor feed failure.
     #[error("tip feed error: {0}")]
     TipFeed(#[from] TipFeedError),
@@ -1146,6 +1154,133 @@ impl TipFeedError {
             Self::ResponseTooLarge => "response_too_large",
             Self::Malformed { .. } => "malformed",
             Self::BookUnavailable => "book_unavailable",
+        }
+    }
+}
+
+/// Command-line failures.
+///
+/// Carries only static text: arguments are never echoed (a mistyped value may
+/// be a secret).
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CliError {
+    /// No command was given.
+    #[error("no command given (try `help`)")]
+    NoCommand,
+
+    /// The command is not one of `check`, `exit`, `help`.
+    #[error("unknown command (try `help`)")]
+    UnknownCommand,
+
+    /// A flag that does not exist (or does not belong to the command).
+    #[error("unknown argument (try `help`)")]
+    UnknownArgument,
+
+    /// More than one command.
+    #[error("only one command may be given")]
+    ExtraCommand,
+
+    /// A flag that needs a value has none.
+    #[error("{flag} needs a value")]
+    MissingValue {
+        /// The flag.
+        flag: &'static str,
+    },
+
+    /// A mandatory flag is absent.
+    #[error("{flag} is required")]
+    MissingFlag {
+        /// The flag.
+        flag: &'static str,
+    },
+
+    /// A flag was given twice.
+    #[error("{flag} was given more than once")]
+    DuplicateFlag {
+        /// The flag.
+        flag: &'static str,
+    },
+
+    /// A flag has an unusable value.
+    #[error("{flag} is invalid: {reason}")]
+    InvalidValue {
+        /// The flag.
+        flag: &'static str,
+        /// Static explanation.
+        reason: &'static str,
+    },
+}
+
+/// Failures of the production bridge (`app`, `network::rpc`, the services).
+///
+/// Carries only static text and status codes: never URLs, keys or amounts.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BridgeError {
+    /// `--live` was given without the exact `--confirm-live` phrase.
+    #[error("live trading refused: --confirm-live must carry the confirmation phrase")]
+    LiveConfirmationMissing,
+
+    /// The recent blockhash could not be fetched.
+    #[error("the recent blockhash is unavailable")]
+    BlockhashUnavailable,
+
+    /// The RPC node answered with a non-success HTTP status.
+    #[error("the RPC node answered with HTTP status {status}")]
+    RpcStatus {
+        /// The status code.
+        status: u16,
+    },
+
+    /// The RPC answer is not a valid `getLatestBlockhash` response.
+    #[error("the RPC answer is malformed")]
+    RpcMalformed,
+
+    /// The RPC answer exceeds the size cap.
+    #[error("the RPC answer is too large")]
+    RpcResponseTooLarge,
+
+    /// The RPC client could not be built.
+    #[error("invalid RPC client configuration: {reason}")]
+    RpcConfig {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// A background service ended abnormally.
+    #[error("the `{service}` service failed")]
+    ServiceFailed {
+        /// Which service.
+        service: &'static str,
+    },
+
+    /// The binary was built without a Yellowstone gRPC link.
+    #[error("this build has no Yellowstone gRPC link (see docs/yellowstone-adapter.md)")]
+    GrpcNotCompiled,
+
+    /// The Yellowstone endpoint is not configured.
+    #[error("YELLOWSTONE_ENDPOINT is required for this command")]
+    YellowstoneNotConfigured,
+
+    /// The async runtime could not be started.
+    #[error("the async runtime could not be started")]
+    Runtime,
+}
+
+impl BridgeError {
+    /// A short, stable, value-free name for logs.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::LiveConfirmationMissing => "live_confirmation_missing",
+            Self::BlockhashUnavailable => "blockhash_unavailable",
+            Self::RpcStatus { .. } => "rpc_status",
+            Self::RpcMalformed => "rpc_malformed",
+            Self::RpcResponseTooLarge => "rpc_response_too_large",
+            Self::RpcConfig { .. } => "rpc_config",
+            Self::ServiceFailed { .. } => "service_failed",
+            Self::GrpcNotCompiled => "grpc_not_compiled",
+            Self::YellowstoneNotConfigured => "yellowstone_not_configured",
+            Self::Runtime => "runtime",
         }
     }
 }

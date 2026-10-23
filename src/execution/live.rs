@@ -480,57 +480,109 @@ impl<E: BlockEngine> LiveExecutor<E> {
         shutdown: ShutdownSignal,
     ) -> Result<ExitReport, LiveError> {
         let submitter = Arc::new(self.sell_submitter(exit.builder, exit.blockhash));
-        let request = subscription_for(exit.curve_account);
-        let monitor = GeyserMonitor::new(transport, request, exit.monitor)?;
-
-        let mut manager = ExitManager::new(exit.engine, exit.curve_account, exit.genesis);
-        if let Some(metrics) = &self.metrics {
-            manager = manager.with_metrics(Arc::clone(metrics));
-        }
-
-        let (events_tx, events_rx) = mpsc::channel(1_024);
-        let (health_tx, _health_rx) = watch::channel(HealthStatus::default());
-        let (orders_tx, orders_rx) = order_channel();
-        let (reports_tx, reports_rx) = report_channel();
-        let (trigger, internal) = shutdown_channel();
-        let trigger = Arc::new(trigger);
-
-        // An external shutdown stops every task; so does the manager finishing.
-        let forward = {
-            let trigger = Arc::clone(&trigger);
-            let mut external = shutdown;
-            tokio::spawn(async move {
-                external.wait().await;
-                trigger.trigger();
-            })
+        let pipeline = ExitPipeline {
+            engine: exit.engine,
+            curve_account: exit.curve_account,
+            genesis: exit.genesis,
+            monitor: exit.monitor,
+            drain_timeout: exit.drain_timeout,
         };
-
-        let monitor_task = tokio::spawn(monitor.run(events_tx, health_tx, internal.clone()));
-        let executor_task = tokio::spawn(run_sell_executor(
-            Arc::clone(&submitter),
-            orders_rx,
-            reports_tx,
-            internal.clone(),
-            exit.drain_timeout,
-        ));
-
-        let summary = manager
-            .run(events_rx, orders_tx, reports_rx, internal)
-            .await;
-
-        trigger.trigger();
-        forward.abort();
-        let health = monitor_task
-            .await
-            .map_err(|_| LiveError::TaskFailed { task: "monitor" })?;
-        executor_task
-            .await
-            .map_err(|_| LiveError::TaskFailed { task: "executor" })?;
-        Ok(ExitReport {
-            summary: summary?,
-            health: health?,
-        })
+        run_exit_pipeline(
+            transport,
+            submitter,
+            pipeline,
+            self.metrics.clone(),
+            shutdown,
+        )
+        .await
     }
+}
+
+/// The parts of an exit that do not depend on how orders are submitted.
+pub struct ExitPipeline {
+    /// The exit engine (plan, settings, position).
+    pub engine: ExitEngine,
+    /// The coin's bonding curve account.
+    pub curve_account: Pubkey,
+    /// The instant the launch was submitted: the zero of the 1 s to 10 s window.
+    pub genesis: Instant,
+    /// Stream supervisor settings.
+    pub monitor: MonitorSettings,
+    /// How long submissions in progress may run after shutdown.
+    pub drain_timeout: Duration,
+}
+
+/// Runs the exit pipeline around any [`SellSubmitter`]: the stream supervisor,
+/// the exit manager and the order executor, until the exit is done or
+/// `shutdown` fires.
+///
+/// [`LiveExecutor::run_exit`] is this function with the live submitter; the
+/// dry-run entry point passes a submitter that never leaves the process.
+///
+/// # Errors
+/// [`LiveError::Exit`] / [`LiveError::Monitor`] from the pipeline, or
+/// [`LiveError::TaskFailed`] if a task died.
+pub async fn run_exit_pipeline<T, S>(
+    transport: T,
+    submitter: Arc<S>,
+    pipeline: ExitPipeline,
+    metrics: Option<Arc<PipelineMetrics>>,
+    shutdown: ShutdownSignal,
+) -> Result<ExitReport, LiveError>
+where
+    T: StreamTransport + Sync + 'static,
+    S: SellSubmitter + 'static,
+{
+    let request = subscription_for(pipeline.curve_account);
+    let monitor = GeyserMonitor::new(transport, request, pipeline.monitor)?;
+
+    let mut manager = ExitManager::new(pipeline.engine, pipeline.curve_account, pipeline.genesis);
+    if let Some(metrics) = metrics {
+        manager = manager.with_metrics(metrics);
+    }
+
+    let (events_tx, events_rx) = mpsc::channel(1_024);
+    let (health_tx, _health_rx) = watch::channel(HealthStatus::default());
+    let (orders_tx, orders_rx) = order_channel();
+    let (reports_tx, reports_rx) = report_channel();
+    let (trigger, internal) = shutdown_channel();
+    let trigger = Arc::new(trigger);
+
+    // An external shutdown stops every task; so does the manager finishing.
+    let forward = {
+        let trigger = Arc::clone(&trigger);
+        let mut external = shutdown;
+        tokio::spawn(async move {
+            external.wait().await;
+            trigger.trigger();
+        })
+    };
+
+    let monitor_task = tokio::spawn(monitor.run(events_tx, health_tx, internal.clone()));
+    let executor_task = tokio::spawn(run_sell_executor(
+        submitter,
+        orders_rx,
+        reports_tx,
+        internal.clone(),
+        pipeline.drain_timeout,
+    ));
+
+    let summary = manager
+        .run(events_rx, orders_tx, reports_rx, internal)
+        .await;
+
+    trigger.trigger();
+    forward.abort();
+    let health = monitor_task
+        .await
+        .map_err(|_| LiveError::TaskFailed { task: "monitor" })?;
+    executor_task
+        .await
+        .map_err(|_| LiveError::TaskFailed { task: "executor" })?;
+    Ok(ExitReport {
+        summary: summary?,
+        health: health?,
+    })
 }
 
 /// The subscription of a live exit: the coin's bonding curve, plus the Pump

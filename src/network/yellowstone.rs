@@ -176,46 +176,56 @@ fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]"
 }
 
-fn validate_endpoint(endpoint: &str) -> Result<(), YellowstoneError> {
+/// Checks the shape of a gRPC/HTTP endpoint: `https` (plain `http` only for
+/// loopback), no credentials, a host, a valid port, no whitespace. The reason is
+/// static, never the value.
+///
+/// # Errors
+/// A static explanation of the first problem found.
+pub fn check_endpoint(endpoint: &str) -> Result<(), &'static str> {
     if endpoint.is_empty() {
-        return Err(reject("is empty"));
+        return Err("is empty");
     }
     if endpoint.len() > MAX_ENDPOINT_BYTES {
-        return Err(reject("is too long"));
+        return Err("is too long");
     }
     if endpoint
         .chars()
         .any(|c| c.is_whitespace() || c.is_control())
     {
-        return Err(reject("contains whitespace or control characters"));
+        return Err("contains whitespace or control characters");
     }
     let Some((scheme, rest)) = split_scheme(endpoint) else {
-        return Err(reject("has no scheme"));
+        return Err("has no scheme");
     };
     let secure = scheme.eq_ignore_ascii_case("https");
     if !secure && !scheme.eq_ignore_ascii_case("http") {
-        return Err(reject("scheme must be https"));
+        return Err("scheme must be https");
     }
     let authority = authority_of(rest);
     if authority.contains('@') {
-        return Err(reject("must not carry credentials"));
+        return Err("must not carry credentials");
     }
     let Some((host, port)) = split_host_port(authority) else {
-        return Err(reject("has an invalid host"));
+        return Err("has an invalid host");
     };
     if host.is_empty() || host == "[]" {
-        return Err(reject("has no host"));
+        return Err("has no host");
     }
     if !secure && !is_loopback(host) {
-        return Err(reject("plain http is only allowed for loopback"));
+        return Err("plain http is only allowed for loopback");
     }
     if let Some(port) = port {
         match port.parse::<u16>() {
             Ok(value) if value != 0 => {}
-            _ => return Err(reject("has an invalid port")),
+            _ => return Err("has an invalid port"),
         }
     }
     Ok(())
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<(), YellowstoneError> {
+    check_endpoint(endpoint).map_err(reject)
 }
 
 fn validate_token(token: &str) -> Result<(), YellowstoneError> {
@@ -558,6 +568,45 @@ pub trait YellowstoneSession: Send {
     /// Sends the client's answer to a server ping: a `SubscribeRequest` whose
     /// `ping` is `{ id: PING_ID }`.
     fn answer_ping(&mut self) -> impl Future<Output = Result<(), MonitorError>> + Send;
+}
+
+// --- The placeholder link -------------------------------------------------------------------------
+
+/// The link of builds without the `grpc` feature: it never connects.
+///
+/// It lets the whole exit pipeline type-check (and the gates cover it) before
+/// the `tonic` binding is added; `open` fails with
+/// [`StreamErrorKind::InvalidRequest`], which the supervisor does not retry.
+/// Callers should refuse to start instead (see `runner`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnavailableLink;
+
+/// The session type of [`UnavailableLink`]: it has no values.
+#[derive(Debug)]
+pub enum UnavailableSession {}
+
+impl YellowstoneLink for UnavailableLink {
+    type Session = UnavailableSession;
+
+    async fn open(
+        &mut self,
+        _settings: &YellowstoneSettings,
+        _request: &WireRequest,
+    ) -> Result<UnavailableSession, MonitorError> {
+        Err(MonitorError::Connection {
+            kind: StreamErrorKind::InvalidRequest,
+        })
+    }
+}
+
+impl YellowstoneSession for UnavailableSession {
+    async fn next_message(&mut self) -> Result<Option<WireMessage>, MonitorError> {
+        match *self {}
+    }
+
+    async fn answer_ping(&mut self) -> Result<(), MonitorError> {
+        match *self {}
+    }
 }
 
 // --- The transport --------------------------------------------------------------------------------

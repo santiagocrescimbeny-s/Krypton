@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use krypton::config::{Config, DEFAULT_DOTENV_PATH, ENV_KEYS};
+use krypton::config::{Config, DEFAULT_DOTENV_PATH, ENV_KEYS, PRODUCTION_ENV_KEYS};
 use krypton::errors::ConfigError;
 use solana_keypair::Keypair;
 
@@ -34,7 +34,7 @@ fn err_of<T, E>(result: Result<T, E>) -> Result<E, Box<dyn Error>> {
 }
 
 fn clear_env() {
-    for key in ENV_KEYS {
+    for key in ENV_KEYS.into_iter().chain(PRODUCTION_ENV_KEYS) {
         std::env::remove_var(key);
     }
 }

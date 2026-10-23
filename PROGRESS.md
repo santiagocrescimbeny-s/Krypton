@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-24 · Rama `audit-hardening-fixes` (parches de auditoría #29, #30, #31 en revisión; `main` `9002c6e` fusionado en ella: 519 tests en Windows, 520 esperados en Linux) · Base: `main` = Fases 1-7 + núcleo de la Fase 8 (fusionado desde `phase8-yellowstone-adapter`, `6523991`; 518 tests en Windows, 519 esperados en Linux) · Fase 8 en curso: falta el enlace `tonic`
+Última actualización: 2026-10-24 · Rama `mainnet-production-bridge` (puente de producción **en revisión**, sin `cargo` real: ver «Puente de producción») · Base: `main` `e8b3e88` = Fases 1-8 (núcleo) + parches de auditoría #29/#30/#31, verificados por el propietario con `cargo` real (519 tests en Windows, 520 esperados en Linux) · Pendiente del enlace `tonic` (feature `grpc`, sin compilar) y de la prueba contra un endpoint real
 
 ## Hoja de ruta
 
@@ -13,7 +13,8 @@
 | 5 | Monitor Yellowstone gRPC + gestor de salida | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`94eae34`); hallazgos #28-#34 de la auditoría 2026-10-22 resueltos salvo #32 (adaptador `tonic`, aplazado); CI verde según el propietario: 342 tests, `cargo clippy -D warnings` y `cargo audit` |
 | 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`0291190`); CI verde según el propietario: 390 tests |
 | 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` desde `phase7-live-trading` (`850463a`); `cargo check`/`clippy -D warnings`/`test --locked` con las crates reales: 452 tests en Windows (el test de permisos `#[cfg(unix)]` se verifica en el CI de Linux) |
-| 8 | Adaptador Yellowstone gRPC y feed de tips de Jito | 🟡 **IN PROGRESS** — núcleo del adaptador y feed de tips fusionados en `main` desde `phase8-yellowstone-adapter` (`6523991`) y verificados con `cargo` real (`check`/`clippy -D warnings`/`test --locked`: 518 tests en Windows); **falta el enlace `tonic`** (requiere cambiar `Cargo.lock`), la prueba de humo contra un endpoint real y el `main` (ver «Fase 8») |
+| 8 | Adaptador Yellowstone gRPC y feed de tips de Jito | ✅ **COMPLETED & VERIFIED** — núcleo del adaptador y feed de tips fusionados en `main` desde `phase8-yellowstone-adapter` (`6523991`) y verificados con `cargo` real (`check`/`clippy -D warnings`/`test --locked`: 518 tests en Windows), más los parches #29/#30/#31 (519). Incluye la preparación del cableado real: `YellowstoneLink`/`YellowstoneSession`, `UnavailableLink` y el enlace `tonic` de referencia tras la *feature* `grpc`. **Salvedad explícita:** el enlace `tonic` no se ha compilado nunca y no hay prueba de humo contra un endpoint real (ver «Puente de producción») |
+| Puente | Binario `krypton`: configuración de producción, `main`, barrera dry→live del proceso, actualizador de `TipBook`, fuente de blockhash | 🟡 **EN REVISIÓN** — rama `mainnet-production-bridge`; la lógica (`app.rs`, `production.rs`, `runner.rs`, `main.rs`) se compiló y probó en un arnés sin `cargo` real (con *stubs* de `Config`/`logging`/red); `config.rs` real, `rpc.rs` y `grpc.rs` **no se han compilado** |
 
 ## Fase 1 — completada y verificada
 
@@ -303,7 +304,7 @@ Verificación: `cargo` real **no** se ejecutó (crates.io bloqueado en el sandbo
 **Verificación con `cargo` real (2026-10-24, Windows):** sobre `2de93f9` (sin la Fase 8) los tres gates en verde con **453 tests**. Tras fusionar `main` (`9002c6e`, núcleo de la Fase 8)
 en esta rama, los tres gates siguen en verde con **519 tests**, 0 fallos (518 de `main` + `the_submitter_never_logs_the_bundle_id`); en Linux se esperan 520 por el test `#[cfg(unix)]` de la Fase 7.
 
-## Fase 8 — Adaptador Yellowstone gRPC y feed de tips de Jito (IN PROGRESS)
+## Fase 8 — Adaptador Yellowstone gRPC y feed de tips de Jito (COMPLETED & VERIFIED)
 
 Rama `phase8-yellowstone-adapter` (desde `main` `9c00e18`). Código nuevo: `src/network/yellowstone.rs`, `src/execution/tip_feed.rs`,
 `src/execution/tip_http.rs`; `YellowstoneError`, `TipFeedError` (y sus variantes en `LauncherError`) en `src/errors.rs`; `tests/phase8_tests.rs` (51 tests) y
@@ -351,8 +352,65 @@ Recuento esperado tras `cargo test --locked` sobre esta rama: 453 (`main`, Linux
 y `cargo test --locked` en verde: **518 tests**, 0 fallos (452 previos + 51 `phase8` + 15 `phase8_http`; el test `#[cfg(unix)]` de la Fase 7 se verifica en el CI de Linux).
 `tip_http.rs` y `phase8_http_tests.rs` quedan así compilados y probados con `reqwest`/`serde_json` reales. Fusionada en `main` por *fast-forward*.
 
-Pendiente de la Fase 8: (1) ~~los tres gates con `cargo` real~~ hecho; (2) enlace `tonic` (añadir `tonic`/`yellowstone-grpc-proto` y regenerar `Cargo.lock` donde crates.io sea alcanzable); (3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada);
-(4) un `main` que lea `YELLOWSTONE_ENDPOINT`/`YELLOWSTONE_X_TOKEN`, lance `run_tip_feed` y `run_exit` (la configuración por entorno no se añadió: `ENV_KEYS` queda en 21 y `Config` intacta).
+Pendiente de la Fase 8 (traspasado al puente de producción): (1) ~~los tres gates con `cargo` real~~ hecho; (2) enlace `tonic`: ahora existe una versión de referencia en `src/network/grpc.rs` tras la *feature* `grpc`, **nunca compilada**; añadir las dependencias y regenerar `Cargo.lock` donde crates.io sea alcanzable (pasos en `docs/yellowstone-adapter.md`);
+(3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada); (4) ~~un `main`~~ escrito en el puente de producción (sin compilar). `ENV_KEYS` sigue en 21: las variables nuevas viven en `PRODUCTION_ENV_KEYS`.
+
+## Puente de producción a mainnet (rama `mainnet-production-bridge`, EN REVISIÓN)
+
+Base: `main` `e8b3e88`. `Cargo.lock` **no** se toca; `Cargo.toml` solo gana la *feature* vacía `grpc` (sin dependencias). `ENV_KEYS` sigue en **21** (el test de `phase1` no cambia):
+las cinco variables nuevas están en `PRODUCTION_ENV_KEYS`.
+
+### Qué se añade
+
+| Pieza | Archivo | Contenido |
+|-------|---------|-----------|
+| Configuración | `src/production.rs` (nuevo), `src/config.rs` | `YELLOWSTONE_ENDPOINT`, `YELLOWSTONE_X_TOKEN` (se borra del entorno del proceso al leerla), `JITO_TIP_STREAM_URL` (URL **HTTP** del `tip_floor`; `ws://`/`wss://` se rechaza), alias `JITO_BLOCK_ENGINE_URL` ↔ `JITO_ENGINE_URL` y `PAYER_KEYPAIR_PATH` ↔ `LIVE_KEYPAIR_PATH` (dos nombres a la vez deben coincidir). Todo opcional; `Config.production` nuevo; ningún error repite el valor |
+| CLI y barrera | `src/app.rs` (nuevo) | `krypton check` y `krypton exit …`; `decide_mode`: **sin `--live` siempre `Dry`**; con `--live` exige `--confirm-live I-UNDERSTAND-REAL-FUNDS-WILL-BE-SPENT` y `LIVE_TRADING`, `DRY_RUN=false`, `LIVE_CONFIRM`, ruta de clave; `preflight_keypair` (archivo regular, no *symlink*, `0600` en Unix, misma clave que `PRIVATE_KEY`) |
+| Servicios | `src/app.rs` | `run_blockhash_refresher` (blockhash con marca de tiempo cada 2 s; si falla conserva el anterior y el *submitter* lo rechaza pasados 40 s), `Services` (refrescador + `run_tip_feed` sobre el `TipBook`, parada ordenada), `summarize` (solo contadores y banderas, sin importes) |
+| Sesión | `src/runner.rs` (nuevo), `src/execution/live.rs` | `check`; `run_exit_command`: dry = `JitoClient` seco + `JitoSellSubmitter` + `run_exit_pipeline`; live = `LiveExecutor::arm` + `run_exit` + feed de tips. `run_exit` se refactorizó en `run_exit_pipeline<T, S>` (mismo cuerpo, ahora reutilizable con cualquier `SellSubmitter`) |
+| Binario | `src/main.rs` (nuevo) | CLI → `Config::from_env` (hilo único) → `logging::init` (`info` por defecto) → preflight 0600 → barrera → *runtime* → sesión; Ctrl-C vía `trigger_on_ctrl_c`; salida sin `println!` (un pipe cerrado no hace pánico) |
+| Blockhash RPC | `src/network/rpc.rs` (nuevo) | `getLatestBlockhash` por `reqwest` (respuesta ≤ 16 KiB, sin redirecciones, errores sin texto remoto, `Debug` sin URL) |
+| Enlace gRPC | `src/network/grpc.rs` (nuevo, *feature* `grpc`), `yellowstone.rs` | `TonicLink` de referencia; `UnavailableLink` para las compilaciones sin la *feature* (todo el pipeline compila en el gate normal, pero `krypton exit` se niega a arrancar). `check_endpoint` extraído de `validate_endpoint` |
+
+### Cómo se ejecuta
+
+`krypton check` (sin red) valida configuración, archivo de clave, barrera y endpoints. `krypton exit --mint … --tokens … --entry-sol-reserves … --entry-token-reserves …` ensaya en seco; para gastar
+fondos reales hacen falta `--live --confirm-live <FRASE>` **y** todo el entorno armado. Códigos de salida: `0` bien, `1` error, `2` línea de comandos, `3` órdenes de resultado desconocido (revisar la cuenta de tokens).
+
+### Decisiones de política (a revisar por el propietario)
+
+- Parámetros por defecto de `exit`: 4 tramos, 100 % de la posición, sin *stop-loss* salvo `--stop-loss-bps`; presupuesto de costes = coste máximo por orden × (tramos + 2).
+- El coste por orden asume el tip **máximo** (`MAX_JITO_TIP_LAMPORTS`); en dry se paga el `JITO_TIP_LAMPORTS` estático y no se consulta el feed.
+- `genesis` (el cero de la ventana de 1 s a 10 s) es el arranque de la sesión: el *launch* no se dispara desde este binario.
+- El blockhash se pide con compromiso `confirmed`; el fee total asumido en la salida es `DEFAULT_TOTAL_FEE_BPS` (la lectura viva de `fee_config`, hallazgo #21, sigue abierta).
+- Sin `JITO_TIP_STREAM_URL`, en vivo se consulta el endpoint público de Jito (se registra en el log).
+
+### Verificación (honesta)
+
+`cargo` real **no** se ejecutó (crates.io inalcanzable). Arnés de prueba (tokio, bytes, thiserror y tracing reales; *mocks* de Solana, `zeroize`, `reqwest` y `serde_json`; *stubs* fieles de `config`, `security`, `network::jito`, `network::rpc` y `tip_http`):
+
+| Qué | Resultado en el arnés |
+|-----|-----------------------|
+| Compilan y pasan `clippy --all-targets -D warnings` | `app.rs`, `production.rs`, `runner.rs`, `main.rs` (contra *stubs* de `Config`, `logging` y red), `live.rs` (refactor), `yellowstone.rs` (`check_endpoint`, `UnavailableLink`), `errors.rs` |
+| `tests/bridge_tests.rs` | **48 tests** en verde: CLI (parseo, errores que no repiten argumentos), barrera (matriz completa), preflight 0600 (modos, *symlink*, clave ajena, sin fuga de ruta), motor de salida, ajustes de producción, refrescador (fallos, silencio, intervalo mínimo, apagado), servicios, una **sesión dry completa** (flujo simulado → 2 órdenes → servicios parados), `runner::check` |
+| Binario | el ejecutable del arnés se lanzó: `help` (código 0), sin comando / comando desconocido / `--mint` inválido (código 2), configuración ausente (1), `check` en seco y `check --live --confirm-live <mal>` (rechazo) |
+| Regresión | `phase5` (108), `phase6` (48), `phase7` (63), `phase8` (51) y los 6 unitarios siguen en verde tras el refactor de `live.rs` |
+| Pruebas de mutación manuales | invertir la barrera, quitar la frase, ignorar `DRY_RUN`, ignorar la clave ajena y el conflicto de alias: cada una rompe al menos un test |
+
+**Sin compilar ni ejecutar con las crates reales:** `src/config.rs` (cableado de las variables y alias; el arnés usa un *stub* que solo imita sus campos), la parte de `main.rs` que toca `Config::from_env`/`logging::init` reales, `src/network/rpc.rs`, `src/network/grpc.rs`, `tests/bridge_config_tests.rs` (13 tests: variables nuevas con `Config` real, alias, limpieza del token en el entorno, parser de blockhash) y el cambio de `tests/env_hygiene_tests.rs`.
+`runner::run_exit_command` solo se probó en sus rutas de rechazo (sin Yellowstone, sin la *feature* `grpc`): no hay prueba de que la sesión completa corra con el enlace real.
+
+Recuento esperado tras `cargo test --locked` (a confirmar): Linux 520 + 48 + 13 = **581**; Windows 519 + 45 + 13 = **577** (los 3 tests de permisos/*symlink* son `#[cfg(unix)]`).
+
+### Pendiente
+
+1. Los tres gates con `cargo` real; corregir lo que salga de los archivos sin compilar.
+2. Enlace `tonic`: añadir `yellowstone-grpc-proto`, `tonic` y `tokio-stream`, regenerar `Cargo.lock`, `cargo audit`, compilar con `--features grpc` y ajustar `grpc.rs` (pasos en `docs/yellowstone-adapter.md`).
+3. Prueba de humo en **dry** contra un endpoint Yellowstone real (cuenta de la curva, *ping*, caída forzada) y contra el `tip_floor` real, antes de cualquier ejecución en vivo.
+4. Sin cablear: el *launch* desde el binario; la lectura del ATA para `ExitEngine::resolve_unknown` (por eso el código de salida 3); `Global`/`fee_config` en vivo (#21).
+5. Deuda conocida: `PRIVATE_KEY` y el archivo de clave duplican el secreto (la barrera exige que coincidan); en Windows no hay comprobación de modo `0600` (usar ACL); `tonic` guarda su propia copia del `x-token` sin `zeroize`.
+
+Corregido de paso (hallazgo #41): `.env.example` y `README.md` mostraban `LIVE_CONFIRM` en minúsculas; el código exige `I-UNDERSTAND-REAL-FUNDS-WILL-BE-SPENT`.
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 

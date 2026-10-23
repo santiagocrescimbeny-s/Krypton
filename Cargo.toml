@@ -62,6 +62,14 @@ publish.workspace = true
 # Minimum supported Rust version; keep in sync with rust-toolchain.toml.
 rust-version = "1.97.1"
 
+[features]
+# The `tonic` Yellowstone link (`src/network/grpc.rs`). It declares no dependencies
+# on purpose: the default build, and Cargo.lock, do not change. To use it, add
+# `yellowstone-grpc-proto`, `tonic` and `tokio-stream` as dependencies on a machine
+# that can reach crates.io (see docs/yellowstone-adapter.md), then build with
+# `--features grpc`.
+grpc = []
+
 [dependencies]
 tokio = { workspace = true }
 solana-sdk = { workspace = true }
