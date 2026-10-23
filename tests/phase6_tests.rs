@@ -262,6 +262,14 @@ fn reactive_order_is_timed_from_ingestion_to_assembly() {
 }
 
 #[test]
+fn latency_metrics_is_the_pipeline_tracker() {
+    let metrics = krypton::metrics::LatencyMetrics::new();
+    metrics.mark_order(1, Some(Instant::now()));
+    metrics.mark_assembled(1);
+    assert_eq!(metrics.snapshot().ingest_to_assembled.count, 1);
+}
+
+#[test]
 fn timer_order_has_no_ingestion_latency() {
     let metrics = PipelineMetrics::new();
     metrics.mark_order(4, None);

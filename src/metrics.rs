@@ -398,6 +398,11 @@ impl PipelineMetrics {
     }
 }
 
+/// The name the roadmap uses for the end-to-end latency tracker: an alias of
+/// [`PipelineMetrics`] (histograms of stream-update-received to
+/// transaction-assembled time, in microseconds).
+pub type LatencyMetrics = PipelineMetrics;
+
 /// An immutable copy of [`PipelineMetrics`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetricsSnapshot {

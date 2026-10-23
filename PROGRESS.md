@@ -200,7 +200,7 @@ saldo de tokens, y las comprobaciones con `cargo` real descritas arriba.
 ## Fase 6 — Harness de simulación, dry-run y observabilidad (IN PROGRESS)
 
 Rama `phase6-harness-simulation` (desde `main` `94eae34`). Código nuevo: `src/metrics.rs`, `src/simulation/{mod,market,harness}.rs`,
-`SimulationError` (y `LauncherError::Simulation`) en `src/errors.rs`, `tests/phase6_tests.rs` (47 tests). Cambios en código existente:
+`SimulationError` (y `LauncherError::Simulation`) en `src/errors.rs`, `tests/phase6_tests.rs` (48 tests). Cambios en código existente:
 `ExitManager::with_metrics` (`monitor/exit.rs`) y `JitoSellSubmitter::with_metrics` (`monitor/submit.rs`), ambos opcionales y sin efecto si no se usan.
 
 | Pieza | Contenido |
@@ -231,13 +231,13 @@ su primera observación); las del temporizador se miden de emisión a ensamblado
 
 Verificación de esta entrega (honesta): crates.io sigue bloqueado en el sandbox, así que **no** se ejecutó `cargo` real ni `--locked`.
 En el *workspace* de prueba (tokio, bytes, thiserror y tracing reales; *mocks* de Solana, `zeroize`, `reqwest`, `serde_json`) compilan
-`metrics.rs`, `simulation/*`, `monitor/{curve,geyser,exit}.rs`, `builder/*`, y pasan **47 tests de `phase6_tests.rs`** y los 108 de
+`metrics.rs`, `simulation/*`, `monitor/{curve,geyser,exit}.rs`, `builder/*`, y pasan **48 tests de `phase6_tests.rs`** y los 108 de
 `phase5_tests.rs`; `clippy --all-targets -- -D warnings` limpio con los lints `deny` del crate. **Sin verificar con las crates reales:**
 firmas reales y tamaño real de `try_compile` (el *mock* los falsea; el test del tamaño del launch usa `MAX_TRANSACTION_SIZE` y debe
 confirmarse), `Config::from_vars` con `DRY_RUN`, `monitor/submit.rs` (solo cambia una línea de métricas) y la compatibilidad de `[const { AtomicU64::new(0) }; N]` con el MSRV (rustc 1.97.1: debería ser válido).
 No se añadieron dependencias ni se tocó `Cargo.lock`.
 
-Recuento esperado tras `cargo test --locked`: 342 (hasta la Fase 5) + 47 `phase6` = **389**.
+Recuento esperado tras `cargo test --locked`: 342 (hasta la Fase 5) + 48 `phase6` = **390**.
 
 Pendiente de la Fase 6: correr los tres gates con `cargo` real, regenerar `Cargo.lock` solo si hiciera falta (no debería), y decidir
 si el binario `main` expone un subcomando `simulate` (hoy el harness es una librería) y si se añade salida estructurada/archivo.
