@@ -11,10 +11,11 @@
 //!   layout of `BondingCurve` follows `idl/pump.json`.
 //! - `Pubkey`s are plain fixed bytes: runs are reproducible.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -3245,7 +3246,25 @@ struct Captured {
     lines: Mutex<Vec<String>>,
 }
 
-struct Capture(Arc<Captured>);
+thread_local! {
+    /// The buffer of the test capturing on this thread, if any.
+    static ACTIVE: RefCell<Option<Arc<Captured>>> = const { RefCell::new(None) };
+}
+
+/// Installed once as the global default rather than per test with
+/// `set_default`: callsite interest is cached process-wide, and a callsite
+/// first hit by another test thread while no scoped subscriber exists can be
+/// cached as never enabled, silently dropping this test's events.
+struct Capture;
+
+/// Stops capturing on this thread when dropped.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|active| active.borrow_mut().take());
+    }
+}
 
 struct Collect<'a>(&'a mut String);
 
@@ -3256,8 +3275,12 @@ impl tracing::field::Visit for Collect<'_> {
 }
 
 impl tracing::Subscriber for Capture {
+    fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+        // Decided per event in `enabled`, never cached.
+        tracing::subscriber::Interest::sometimes()
+    }
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
+        ACTIVE.with(|active| active.borrow().is_some())
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -3267,18 +3290,28 @@ impl tracing::Subscriber for Capture {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut line = format!("{} {}", event.metadata().level(), event.metadata().target());
         event.record(&mut Collect(&mut line));
-        if let Ok(mut lines) = self.0.lines.lock() {
-            lines.push(line);
-        }
+        ACTIVE.with(|active| {
+            if let Some(captured) = active.borrow().as_ref() {
+                if let Ok(mut lines) = captured.lines.lock() {
+                    lines.push(line);
+                }
+            }
+        });
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-fn capture() -> (Arc<Captured>, tracing::subscriber::DefaultGuard) {
+/// Captures events on this thread until the guard drops. The test runtime is
+/// current-thread, so every task the test spawns logs here too.
+fn capture() -> Result<(Arc<Captured>, CaptureGuard), Box<dyn Error>> {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    if !*INSTALLED.get_or_init(|| tracing::subscriber::set_global_default(Capture).is_ok()) {
+        return Err("another global tracing subscriber is installed".into());
+    }
     let captured = Arc::new(Captured::default());
-    let guard = tracing::subscriber::set_default(Capture(Arc::clone(&captured)));
-    (captured, guard)
+    ACTIVE.with(|active| *active.borrow_mut() = Some(Arc::clone(&captured)));
+    Ok((captured, CaptureGuard))
 }
 
 /// A submitter whose failures carry Block Engine text.
@@ -3306,7 +3339,7 @@ fn looks_like_key_material(line: &str) -> bool {
 
 #[tokio::test(start_paused = true)]
 async fn logs_never_contain_keys_signatures_amounts_or_balances() -> Result<(), Box<dyn Error>> {
-    let (captured, _guard) = capture();
+    let (captured, _guard) = capture()?;
 
     // 1. A pipeline with an undecodable update, an unknown outcome, a failed
     //    submission, a failed-outcome report and a closed update stream.
