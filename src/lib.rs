@@ -14,6 +14,9 @@
 //! ([`monitor::curve`]), the multi-tranche exit engine ([`monitor::exit`]) and the
 //! Jito-backed sell submitter ([`monitor::submit`]).
 //!
+//! Phase 7 adds [`execution`]: the dry-to-live barrier, the spending guards, the
+//! dynamic Jito tip and the live executor.
+//!
 //! Phase 6 adds [`simulation`] (a network-free dry-run of the whole token
 //! lifecycle with deterministic stress injection) and [`metrics`] (zero-allocation
 //! microsecond latency tracking from stream ingestion to transaction assembly).
@@ -35,6 +38,7 @@
 pub mod builder;
 pub mod config;
 pub mod errors;
+pub mod execution;
 pub mod logging;
 pub mod metrics;
 pub mod monitor;

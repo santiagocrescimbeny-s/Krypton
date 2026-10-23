@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-23 · Base: `main` (`94eae34`) = Fases 1-5 + correcciones de las auditorías (CI verde según el propietario: 342 tests, clippy y `cargo audit`); rama `phase6-harness-simulation` (desde `94eae34`): Fase 6 en curso
+Última actualización: 2026-10-23 · Base: `main` (`0291190`) = Fases 1-6 (CI verde según el propietario: 390 tests); rama `phase7-live-trading` (desde `0291190`): Fase 7 en curso
 
 ## Hoja de ruta
 
@@ -11,7 +11,8 @@
 | 3 | Constructor atómico de transacciones (Create + Buy) | ✅ **COMPLETED & VERIFIED** (auditoría 2026-10-20 run 2; guardas #19/#20/#22 confirmadas por el propietario con 164 tests en `main`) |
 | 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | ✅ **COMPLETED & VERIFIED** (213 tests en `main` según el propietario; fusionada en `26d4ecf`) |
 | 5 | Monitor Yellowstone gRPC + gestor de salida | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`94eae34`); hallazgos #28-#34 de la auditoría 2026-10-22 resueltos salvo #32 (adaptador `tonic`, aplazado); CI verde según el propietario: 342 tests, `cargo clippy -D warnings` y `cargo audit` |
-| 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | 🟡 **IN PROGRESS** — `phase6-harness-simulation`: código y tests escritos; verificación con `cargo` real pendiente (ver «Fase 6») |
+| 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`0291190`); CI verde según el propietario: 390 tests |
+| 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | 🟡 **IN PROGRESS** — `phase7-live-trading`: código y tests escritos; verificación con `cargo` real pendiente (ver «Fase 7») |
 
 ## Fase 1 — completada y verificada
 
@@ -197,7 +198,7 @@ Recuento esperado tras `cargo test --locked`: 213 (Fases 1-4) + 108 `phase5` + 1
 Pendiente de la Fase 5: adaptador Yellowstone real (`tonic`), cableado en un `main` con `trigger_on_ctrl_c`, lectura viva del
 saldo de tokens, y las comprobaciones con `cargo` real descritas arriba.
 
-## Fase 6 — Harness de simulación, dry-run y observabilidad (IN PROGRESS)
+## Fase 6 — Harness de simulación, dry-run y observabilidad (COMPLETED & VERIFIED)
 
 Rama `phase6-harness-simulation` (desde `main` `94eae34`). Código nuevo: `src/metrics.rs`, `src/simulation/{mod,market,harness}.rs`,
 `SimulationError` (y `LauncherError::Simulation`) en `src/errors.rs`, `tests/phase6_tests.rs` (48 tests). Cambios en código existente:
@@ -241,6 +242,44 @@ Recuento esperado tras `cargo test --locked`: 342 (hasta la Fase 5) + 48 `phase6
 
 Pendiente de la Fase 6: correr los tres gates con `cargo` real, regenerar `Cargo.lock` solo si hiciera falta (no debería), y decidir
 si el binario `main` expone un subcomando `simulate` (hoy el harness es una librería) y si se añade salida estructurada/archivo.
+
+## Fase 7 — Trading en vivo e integración con mainnet (IN PROGRESS)
+
+Rama `phase7-live-trading` (desde `main` `0291190`). Código nuevo: `src/execution/{mod,settings,gate,guards,tip,live}.rs`,
+`GuardError`, `LiveError`, `LauncherError::Live` y `ExitError::GuardRejected` en `src/errors.rs`, `tests/phase7_tests.rs` (63 tests).
+Cambios en código existente: `Config.live: LiveSettings` y 5 claves de entorno nuevas (`ENV_KEYS` 16 → 21) en `src/config.rs`,
+`pub mod execution;` en `src/lib.rs`, aserción de `ENV_KEYS.len()` en `tests/phase1_tests.rs`. No se añadieron dependencias ni se tocó `Cargo.lock`.
+
+| Pieza | Contenido |
+|-------|-----------|
+| `execution/settings.rs` | `LiveSettings` (`LIVE_TRADING`, `LIVE_CONFIRM`, `LIVE_KEYPAIR_PATH`, `MAX_SOL_PER_TX`, `DAILY_DRAWDOWN_SOL`); todo desactivado por defecto; techos absolutos (10 SOL por tx, 50 SOL al día); `Debug` sin la ruta; los errores no repiten el valor |
+| `execution/gate.rs` | Barrera dry→live: `arm()` valida, en orden, `LIVE_TRADING`, `DRY_RUN=false`, la frase de confirmación, ambos límites, la ruta, el archivo de clave (regular, no *symlink*, `0600`, tamaño acotado, UTF-8, formato) y que su clave pública coincida con la billetera configurada; después el techo de *slippage* y la coherencia de límites y tip |
+| `execution/guards.rs` | `SpendingGuards`: reserva atómica (`reserve → commit/release`) bajo `Mutex`; tope por transacción, límite diario neto (las reservas abiertas cuentan), *tripwire* que bloquea **entradas** al agotar el día (las **salidas** nunca se bloquean), reinicio diario del contador sin levantar el bloqueo (`rearm()` explícito), retornos que compensan gasto sin crear crédito, techo de *slippage* ≤ 10 % |
+| `execution/tip.rs` | `TipPolicy`/`TipBook`: percentil p95 para el lanzamiento y p75 para la salida; amortiguación de picos (techo = 3 × mediana EMA, nunca por debajo del tip base); tope proporcional al nocional (5 %); tope duro `MAX_JITO_TIP_LAMPORTS`; suelo del mínimo de Jito; si no hay observación fresca (≤ 30 s) usa el tip configurado |
+| `execution/live.rs` | `BlockEngine` (implementado para `JitoClient`; en tests, un motor simulado), `LiveExecutor`: `launch` (guardas → tip → construcción firmada → envío → sondeo del bundle → liquidación de la reserva), `sell_submitter` (`SellSubmitter` con las mismas guardas) y `run_exit` (monitor Geyser real + `ExitManager` + ejecutor de ventas, genérico sobre `StreamTransport`) |
+
+Liquidación de reservas (la regla que evita doble gasto y fugas): `Landed`/`Unknown` → *commit* (puede haber aterrizado); `Failed` o error
+definitivo de envío → *release*; un envío ambiguo (timeout) → `Unknown`, no error. Una venta aterrizada registra además sus ingresos netos como retorno.
+
+Estado de seguridad: sin `unwrap`/`expect`/`panic!`/`unsafe`/`println!` en `src/execution` (test de rastreo de fuentes). Ningún test abre sockets.
+
+Verificación de esta entrega (honesta): crates.io sigue bloqueado, así que **no** se ejecutó `cargo` real ni `--locked`. En el *workspace* de prueba
+(tokio, bytes, thiserror y tracing reales; *mocks* de Solana, `zeroize`, `reqwest` y `serde_json`, y *stubs* de `config`, `security` y `network`) compilan
+`src/execution/*` y pasan los **63 tests de `phase7_tests.rs`**, más los 108 de `phase5_tests.rs` y los 48 de `phase6_tests.rs`;
+`clippy --all-targets -- -D warnings` limpio. **Sin verificar con las crates reales:** los cambios de `src/config.rs` (los tests de `Config::from_vars` en
+`phase7_tests.rs` se ejecutaron contra un *stub*), el `impl BlockEngine for JitoClient`, el comportamiento real de permisos de archivo, `tests/phase1_tests.rs`
+(aserción 16 → 21) y el rustfmt de `src/` completo.
+
+Límites conocidos (no ocultos):
+
+- **Yellowstone/`tonic` real:** no incluido (hallazgo #32 sigue aplazado, ver `docs/yellowstone-adapter.md`). `run_exit` es genérico sobre `StreamTransport`; el adaptador real se conecta ahí sin tocar el resto.
+- **Suelo de tips de Jito:** `TipBook::update` es el punto de inyección; falta el *feed* HTTP/WebSocket y su *parser*. Sin datos frescos se usa `JITO_TIP_LAMPORTS`.
+- **Saldo y *blockhash* vivos:** `LaunchRequest` recibe el saldo disponible y el *blockhash*; leerlos del RPC corresponde al `main` que cablee el binario.
+- Sin prueba contra mainnet/devnet real: el Block Engine está simulado en la frontera `BlockEngine`.
+
+Recuento esperado tras `cargo test --locked`: 390 + 63 `phase7` = **453**.
+
+Pendiente de la Fase 7: correr los tres gates con `cargo` real, adaptador `tonic`, *feed* del suelo de tips y un `main` que cablee todo detrás de la barrera.
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 

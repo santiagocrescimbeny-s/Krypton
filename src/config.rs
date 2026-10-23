@@ -33,6 +33,10 @@ use serde::Deserialize;
 use solana_commitment_config::CommitmentConfig;
 
 use crate::errors::{ConfigError, WalletError};
+use crate::execution::settings::{
+    LiveSettings, RawLiveSettings, ENV_DAILY_DRAWDOWN_SOL, ENV_LIVE_CONFIRM, ENV_LIVE_KEYPAIR_PATH,
+    ENV_LIVE_TRADING, ENV_MAX_SOL_PER_TX,
+};
 use crate::parsing::{parse_bool, parse_sol_to_lamports};
 use crate::security::{SecretString, SecureWallet};
 
@@ -73,7 +77,7 @@ pub const ENV_LOG_LEVEL: &str = "LOG_LEVEL";
 
 /// Every variable the configuration reads. Must stay in sync with [`RawConfig`]
 /// (its fields are renamed to these exact names).
-pub const ENV_KEYS: [&str; 16] = [
+pub const ENV_KEYS: [&str; 21] = [
     ENV_RPC_URL,
     ENV_RPC_WS_URL,
     ENV_JITO_ENGINE_URL,
@@ -90,6 +94,11 @@ pub const ENV_KEYS: [&str; 16] = [
     ENV_DRY_RUN,
     ENV_LOG_DIR,
     ENV_LOG_LEVEL,
+    ENV_LIVE_TRADING,
+    ENV_LIVE_CONFIRM,
+    ENV_LIVE_KEYPAIR_PATH,
+    ENV_MAX_SOL_PER_TX,
+    ENV_DAILY_DRAWDOWN_SOL,
 ];
 
 // --- Defaults and limits -------------------------------------------------------
@@ -154,6 +163,11 @@ struct RawConfig {
     dry_run: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
+    live_trading: Option<String>,
+    live_confirm: Option<String>,
+    live_keypair_path: Option<String>,
+    max_sol_per_tx: Option<String>,
+    daily_drawdown_sol: Option<String>,
 }
 
 // --- Validated configuration ---------------------------------------------------
@@ -195,6 +209,9 @@ pub struct Config {
     pub log_dir: PathBuf,
     /// Minimum level to log.
     pub log_level: tracing::Level,
+    /// Live-trading opt-in and capital limits (Phase 7). Inert unless
+    /// [`crate::execution::live::LiveExecutor::arm`] accepts it.
+    pub live: LiveSettings,
     /// The parsed wallet. The textual key is not kept (see the module docs).
     wallet: SecureWallet,
 }
@@ -396,6 +413,14 @@ impl Config {
             None => CommitmentConfig::processed(),
         };
 
+        let live = LiveSettings::from_raw(RawLiveSettings {
+            live_trading: raw.live_trading,
+            live_confirm: raw.live_confirm,
+            live_keypair_path: raw.live_keypair_path,
+            max_sol_per_tx: raw.max_sol_per_tx,
+            daily_drawdown_sol: raw.daily_drawdown_sol,
+        })?;
+
         Ok(Self {
             rpc_url: parse_url(ENV_RPC_URL, &rpc_url, &["http", "https"])?,
             rpc_ws_url: clean(raw.rpc_ws_url)
@@ -415,6 +440,7 @@ impl Config {
             log_dir: clean(raw.log_dir)
                 .map_or_else(|| PathBuf::from(DEFAULT_LOG_DIR), PathBuf::from),
             log_level,
+            live,
             wallet,
         })
     }
@@ -458,6 +484,7 @@ impl fmt::Debug for Config {
             .field("dry_run", &self.dry_run)
             .field("log_dir", &self.log_dir)
             .field("log_level", &self.log_level)
+            .field("live", &self.live)
             .field("private_key", &"<redacted>")
             .finish()
     }

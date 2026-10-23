@@ -481,7 +481,7 @@ fn every_documented_variable_is_honoured() -> TestResult {
 
 #[test]
 fn env_key_list_is_complete_and_unique() {
-    assert_eq!(ENV_KEYS.len(), 16);
+    assert_eq!(ENV_KEYS.len(), 21);
     let unique: std::collections::HashSet<_> = ENV_KEYS.iter().collect();
     assert_eq!(unique.len(), ENV_KEYS.len());
 }

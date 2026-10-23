@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) en curso en `phase6-harness-simulation`. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) en curso en `phase7-live-trading`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
@@ -26,6 +26,7 @@ src/
   docs/yellowstone-adapter.md  Contrato del adaptador gRPC de Yellowstone
   metrics.rs               Fase 6: histogramas de latencia en µs (ingesta del stream → ensamblado de la transacción)
   simulation/              Fase 6: market (curva determinista) y harness (ciclo de vida completo en dry-run, sin red)
+  execution/               Fase 7: settings (flags en vivo), gate (barrera dry→live), guards (SpendingGuards), tip (tip dinámico), live (LiveExecutor)
   logging.rs               Fase 5: suscriptor `tracing` con `EnvFilter` (`info` por defecto, sin datos sensibles)
   monitor/                 andamiaje para la fase 5
 tests/phase1_tests.rs      pruebas de wallet, zeroize y configuración
@@ -33,6 +34,7 @@ tests/phase2_tests.rs      pruebas del motor de metadatos (servidor HTTP simulad
 tests/phase3_tests.rs      pruebas de PDAs, curva, instrucciones, transacción y guardas de gasto
 tests/phase4_tests.rs      pruebas de ALT, tip de Jito, tamaño de la tx y cliente (servidor HTTP simulado)
 tests/phase6_tests.rs      pruebas del harness de simulación, el mercado simulado y las métricas de latencia (sin red)
+tests/phase7_tests.rs      pruebas de la barrera dry→live, las guardas de capital, el tip dinámico y el LiveExecutor (Block Engine simulado, sin red)
 tests/env_hygiene_tests.rs higiene del entorno (.env explícito, PRIVATE_KEY limpiada)
 tests/common/mod.rs        servidor HTTP de pruebas (solo std)
 ```
@@ -69,3 +71,19 @@ Topes de gasto (validados al arrancar y de nuevo en el constructor):
 
 `DRY_RUN` es `true` por defecto: nada se envía a la red salvo que se desactive
 explícitamente.
+
+### Trading en vivo (Fase 7)
+
+`LiveExecutor::arm(&config)` solo arranca si **todo** esto se cumple; si no, devuelve un `LiveError` explícito (nunca entra en pánico):
+
+| Variable | Requisito |
+|----------|-----------|
+| `DRY_RUN` | `false` (con `LIVE_TRADING=true` y `DRY_RUN=true` → `LiveError::DryRunEnabled`) |
+| `LIVE_TRADING` | `true` |
+| `LIVE_CONFIRM` | exactamente `i-understand-real-funds-will-be-spent` |
+| `LIVE_KEYPAIR_PATH` | archivo regular (no *symlink*), modo `600` en Unix, ≤ 4 KiB; su clave pública debe coincidir con `PRIVATE_KEY` |
+| `MAX_SOL_PER_TX` | > 0 y ≤ 10 SOL (tope por transacción) |
+| `DAILY_DRAWDOWN_SOL` | ≥ `MAX_SOL_PER_TX` y ≤ 50 SOL (límite diario neto) |
+
+Además, `SLIPPAGE_BPS` ≤ 1000 (10 %) se vuelve a comprobar en la barrera, y el tip dinámico nunca supera `MAX_JITO_TIP_LAMPORTS`.
+`ENV_KEYS` pasa de 16 a 21 claves. Los mensajes de error no incluyen rutas ni valores.

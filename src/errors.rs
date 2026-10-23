@@ -67,6 +67,10 @@ pub enum LauncherError {
     #[error("simulation error: {0}")]
     Simulation(#[from] SimulationError),
 
+    /// Live-trading barrier, spending guard or live execution failure.
+    #[error("live trading error: {0}")]
+    Live(#[from] LiveError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -835,6 +839,11 @@ pub enum ExitError {
     /// Bundle submission failed.
     #[error("Jito error: {0}")]
     Jito(#[from] JitoError),
+
+    /// A live spending guard refused the order (per-transaction cap, daily
+    /// drawdown or the halt latch). Carries no amounts.
+    #[error("a spending guard refused the order")]
+    GuardRejected(#[from] GuardError),
 }
 
 /// Failures of the dry-run simulation harness (Phase 6).
@@ -886,6 +895,134 @@ pub enum SimulationError {
     Wallet(#[from] WalletError),
 }
 
+/// Refusals of the live spending guards (Phase 7).
+///
+/// Variants carry static labels only: no amounts, limits or balances, so they
+/// are safe to log.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum GuardError {
+    /// The guard limits are inconsistent or out of range.
+    #[error("invalid spending limits: {reason}")]
+    InvalidLimits {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// One transaction would spend more than the per-transaction cap.
+    #[error("the transaction exceeds the per-transaction spending cap")]
+    PerTransactionCap,
+
+    /// The order would take the day's net spend past the drawdown limit.
+    #[error("the order would exceed the daily drawdown limit")]
+    DailyDrawdown,
+
+    /// The drawdown tripwire fired earlier; new entries stay blocked until an
+    /// explicit re-arm.
+    #[error("new entries are halted after the daily drawdown tripwire")]
+    Halted,
+
+    /// The requested slippage tolerance exceeds the 10 % hard cap.
+    #[error("the slippage tolerance exceeds the 10% hard cap")]
+    SlippageTooHigh,
+
+    /// The guard state was poisoned by a panicking task.
+    #[error("the spending guard state is unavailable")]
+    StatePoisoned,
+}
+
+/// Failures of the dry-to-live barrier and of live execution (Phase 7).
+///
+/// Variants carry static labels only (no amounts, paths or keys).
+#[derive(Debug, Error)]
+pub enum LiveError {
+    /// `DRY_RUN` is still `true`.
+    #[error("live trading refused: DRY_RUN must be explicitly set to false")]
+    DryRunEnabled,
+
+    /// `LIVE_TRADING` is not `true`.
+    #[error("live trading refused: LIVE_TRADING=true is required")]
+    NotArmed,
+
+    /// `LIVE_CONFIRM` does not carry the confirmation phrase.
+    #[error("live trading refused: LIVE_CONFIRM must carry the confirmation phrase")]
+    ConfirmationMissing,
+
+    /// A mandatory capital limit is not configured.
+    #[error("live trading refused: {name} is required")]
+    LimitMissing {
+        /// The environment variable.
+        name: &'static str,
+    },
+
+    /// `LIVE_KEYPAIR_PATH` is not set.
+    #[error("live trading refused: LIVE_KEYPAIR_PATH is required")]
+    KeypairPathMissing,
+
+    /// The keypair file failed a safety check.
+    #[error("live trading refused: keypair file rejected ({reason})")]
+    KeypairFile {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The keypair file is not the configured wallet.
+    #[error("live trading refused: the keypair file does not match the configured wallet")]
+    KeypairMismatch,
+
+    /// The Block Engine client is in dry-run mode.
+    #[error("live trading refused: the Block Engine client is in dry-run mode")]
+    EngineIsDryRun,
+
+    /// The tip policy parameters are inconsistent.
+    #[error("invalid tip policy: {reason}")]
+    InvalidTipPolicy {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The tip floor feed returned unusable data.
+    #[error("tip floor feed error: {reason}")]
+    TipFeed {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// A shared live structure was poisoned by a panicking task.
+    #[error("live execution state is unavailable")]
+    StatePoisoned,
+
+    /// The system clock is before the Unix epoch.
+    #[error("the system clock is unavailable")]
+    ClockUnavailable,
+
+    /// A live task ended abnormally.
+    #[error("the `{task}` live task failed")]
+    TaskFailed {
+        /// Which task.
+        task: &'static str,
+    },
+
+    /// A spending guard refused the order.
+    #[error("spending guard: {0}")]
+    Guard(#[from] GuardError),
+
+    /// Transaction construction failed.
+    #[error("builder error: {0}")]
+    Builder(#[from] BuilderError),
+
+    /// The Block Engine failed.
+    #[error("Jito error: {0}")]
+    Jito(#[from] JitoError),
+
+    /// The exit pipeline failed.
+    #[error("exit error: {0}")]
+    Exit(#[from] ExitError),
+
+    /// The stream monitor failed.
+    #[error("monitor error: {0}")]
+    Monitor(#[from] MonitorError),
+}
+
 /// Failures while installing the `tracing` subscriber.
 ///
 /// Carries only static text, so it is always safe to log or print.
@@ -919,6 +1056,7 @@ impl ExitError {
             Self::StaleBlockhash => "stale_blockhash",
             Self::Builder(_) => "builder_error",
             Self::Jito(_) => "jito_error",
+            Self::GuardRejected(_) => "guard_rejected",
         }
     }
 }
