@@ -10,6 +10,21 @@
 //! [`SellOutcome::Simulated`] after the transaction was fully assembled and
 //! signed, so the whole path is rehearsed.
 //!
+//! # Stale blockhashes (audit finding #29)
+//! The channel carries a [`TimedBlockhash`], the hash plus the instant it was
+//! observed. A hash older than [`MAX_BLOCKHASH_AGE`] is refused with
+//! [`ExitError::StaleBlockhash`] *before* anything is signed or sent: a dead
+//! refresher would otherwise produce transactions that expire silently inside the
+//! 1-10 s exit window.
+//!
+//! # Outcomes (audit finding #30)
+//! The first status check runs immediately; the polling interval is only slept
+//! *between* checks. Once the Block Engine may have accepted the bundle, no
+//! error and no exhausted polling budget is reported as a failure: the result is
+//! [`SellOutcome::Unknown`], so the exit engine does not re-offer the tokens and
+//! pay the tip and priority fee of a duplicate sell. [`SellOutcome::Failed`] is
+//! reserved for bundles that the Block Engine reported failed or invalid.
+//!
 //! The public Block Engine allows about one request per second: keep
 //! `poll_interval` at one second or more when using it.
 
@@ -18,14 +33,39 @@ use std::time::Duration;
 
 use solana_sdk::hash::Hash;
 use tokio::sync::watch;
-use tokio::time::sleep;
-use tracing::debug;
+use tokio::time::{sleep, Instant};
+use tracing::{debug, warn};
 
 use super::exit::{SellOrder, SellOutcome, SellSubmitter};
 use crate::builder::sell::SellBuilder;
 use crate::errors::{ExitError, JitoError};
 use crate::network::{InflightStatus, JitoClient, JitoTip};
 use crate::security::SecureWallet;
+
+/// A blockhash together with the instant the refresher observed it.
+pub type TimedBlockhash = (Hash, Instant);
+
+/// Oldest blockhash a sell may be signed with. A blockhash is valid for about
+/// 150 slots (roughly 60 s); 40 s leaves the transaction time to land.
+pub const MAX_BLOCKHASH_AGE: Duration = Duration::from_secs(40);
+
+/// Stamps `hash` with the current instant. The refresher calls this each time
+/// it fetches a new blockhash and publishes the result on the channel.
+#[must_use]
+pub fn stamp_blockhash(hash: Hash) -> TimedBlockhash {
+    (hash, Instant::now())
+}
+
+/// Creates the blockhash channel, seeded with `initial` stamped now.
+#[must_use]
+pub fn blockhash_channel(
+    initial: Hash,
+) -> (
+    watch::Sender<TimedBlockhash>,
+    watch::Receiver<TimedBlockhash>,
+) {
+    watch::channel(stamp_blockhash(initial))
+}
 
 /// Default pause between bundle status checks.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -37,7 +77,7 @@ pub struct JitoSellSubmitter {
     client: Arc<JitoClient>,
     builder: SellBuilder,
     wallet: Arc<SecureWallet>,
-    blockhash: watch::Receiver<Hash>,
+    blockhash: watch::Receiver<TimedBlockhash>,
     tip: JitoTip,
     poll_interval: Duration,
     max_polls: u32,
@@ -55,13 +95,14 @@ impl std::fmt::Debug for JitoSellSubmitter {
 
 impl JitoSellSubmitter {
     /// Builds a submitter. `tip` must already respect `MAX_JITO_TIP_LAMPORTS`
-    /// ([`JitoTip`] guarantees it); `blockhash` is kept fresh by the caller.
+    /// ([`JitoTip`] guarantees it); `blockhash` is kept fresh by the caller and
+    /// refused once older than [`MAX_BLOCKHASH_AGE`].
     #[must_use]
     pub fn new(
         client: Arc<JitoClient>,
         builder: SellBuilder,
         wallet: Arc<SecureWallet>,
-        blockhash: watch::Receiver<Hash>,
+        blockhash: watch::Receiver<TimedBlockhash>,
         tip: JitoTip,
     ) -> Self {
         Self {
@@ -84,10 +125,23 @@ impl JitoSellSubmitter {
     }
 }
 
+impl JitoSellSubmitter {
+    /// The current blockhash, or [`ExitError::StaleBlockhash`] when it is older
+    /// than [`MAX_BLOCKHASH_AGE`]. The tuple is copied out so the watch guard is
+    /// not held across an await.
+    fn fresh_blockhash(&self) -> Result<Hash, ExitError> {
+        let (hash, observed_at) = *self.blockhash.borrow();
+        if observed_at.elapsed() > MAX_BLOCKHASH_AGE {
+            return Err(ExitError::StaleBlockhash);
+        }
+        Ok(hash)
+    }
+}
+
 impl SellSubmitter for JitoSellSubmitter {
     async fn submit(&self, order: &SellOrder) -> Result<SellOutcome, ExitError> {
-        // Copy the hash out so the watch guard is not held across an await.
-        let blockhash = *self.blockhash.borrow();
+        // Refuse before signing: nothing is sent with a hash about to expire.
+        let blockhash = self.fresh_blockhash()?;
         let tip_instruction = self.tip.instruction(&self.builder.payer())?;
         let transaction = self.builder.build_signed(
             &order.plan,
@@ -103,12 +157,21 @@ impl SellSubmitter for JitoSellSubmitter {
         {
             Ok(id) => id,
             Err(JitoError::DryRun) => return Ok(SellOutcome::Simulated),
+            // The request may have reached the Block Engine: there is no bundle
+            // id to poll, and a repeat could double-sell.
+            Err(error) if error.may_have_been_accepted() => {
+                warn!(sequence = order.sequence, %error, "sendBundle outcome ambiguous");
+                return Ok(SellOutcome::Unknown);
+            }
             Err(error) => return Err(error.into()),
         };
         debug!(sequence = order.sequence, bundle = %bundle_id, "sell bundle submitted");
 
-        for _ in 0..self.max_polls {
-            sleep(self.poll_interval).await;
+        for attempt in 0..self.max_polls {
+            // The first check is immediate; the interval separates later ones.
+            if attempt > 0 {
+                sleep(self.poll_interval).await;
+            }
             match self.client.inflight_status(&bundle_id).await {
                 Ok(InflightStatus::Landed { slot }) => return Ok(SellOutcome::Landed { slot }),
                 Ok(InflightStatus::Failed | InflightStatus::Invalid) => {
@@ -118,11 +181,14 @@ impl SellSubmitter for JitoSellSubmitter {
                 Err(error) if error.is_retryable() => {
                     debug!(sequence = order.sequence, %error, "status check failed; retrying");
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    // The bundle was accepted, so this is not a failed sell.
+                    warn!(sequence = order.sequence, %error, "status check failed permanently");
+                    return Ok(SellOutcome::Unknown);
+                }
             }
         }
-        // Unknown outcome: treated as failed. Selling again is safe, because a
-        // duplicate fails on chain once the tokens are gone.
-        Ok(SellOutcome::Failed)
+        // The bundle may still land: selling again could double-sell.
+        Ok(SellOutcome::Unknown)
     }
 }

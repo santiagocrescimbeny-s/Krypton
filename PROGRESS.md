@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-22 · Base: `main` (`26d4ecf`) = Fases 1-4 + correcciones de las auditorías; rama `phase5-monitor-exit`
+Última actualización: 2026-10-23 · Base: `main` (`26d4ecf`) = Fases 1-4 + correcciones de las auditorías; rama `phase5-monitor-exit` (`6d5f99c` + correcciones de la auditoría 2026-10-22, #28-#34), fusionable por *fast-forward*
 
 ## Hoja de ruta
 
@@ -10,7 +10,7 @@
 | 2 | Motor asíncrono de metadatos (IPFS / Pinata) | ✅ **VERIFICADA** (auditoría 2026-10-20) |
 | 3 | Constructor atómico de transacciones (Create + Buy) | ✅ **COMPLETED & VERIFIED** (auditoría 2026-10-20 run 2; guardas #19/#20/#22 confirmadas por el propietario con 164 tests en `main`) |
 | 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | ✅ **COMPLETED & VERIFIED** (213 tests en `main` según el propietario; fusionada en `26d4ecf`) |
-| 5 | Monitor Yellowstone gRPC + gestor de salida | 🚧 **IN PROGRESS** — rama `phase5-monitor-exit`: código y tests escritos, gates de `cargo` real pendientes |
+| 5 | Monitor Yellowstone gRPC + gestor de salida | 🟡 **CÓDIGO COMPLETO · VERIFICACIÓN PENDIENTE** — `phase5-monitor-exit`: hallazgos #29/#30/#31/#33/#34 corregidos; falta correr `cargo check/clippy/test --locked` con las crates reales (y regenerar `Cargo.lock`, #28). Pasa a `COMPLETED & VERIFIED` solo con esos tres gates en verde |
 | 6 | Harness de pruebas, `tracing` y dry-run | ⬜ Pendiente |
 
 ## Fase 1 — completada y verificada
@@ -143,12 +143,12 @@ Verificación de esta entrega: `rustfmt --check` limpio; `alt.rs` y el builder c
 reales (crates.io bloqueado en el sandbox), por lo que el cliente HTTP (`reqwest`/`serde`) y `tests/phase4_tests.rs` están sin compilar.
 Recuento esperado: 6 unitarios + 6 `env_hygiene` + 38 `phase1` + 38 `phase2` + 77 `phase3` + 48 `phase4` = **213**.
 
-## Fase 5 — Monitor de flujo y gestor de salida (IN PROGRESS)
+## Fase 5 — Monitor de flujo y gestor de salida (CÓDIGO COMPLETO · VERIFICACIÓN PENDIENTE)
 
 Rama `phase5-monitor-exit`. Código nuevo: `src/monitor/{curve,geyser,exit,submit}.rs`, `src/builder/sell.rs`,
 `SellPlan` en `builder/math.rs`, `sell_v3` en `builder/instructions.rs`, variantes `MonitorError` / `ExitError` /
-`StreamErrorKind` / `BuilderError::ZeroSellAmount` en `src/errors.rs`, `tests/phase5_tests.rs` (97 tests),
-`tests/phase5_submit_tests.rs` (10 tests) y `docs/yellowstone-adapter.md`.
+`StreamErrorKind` / `BuilderError::ZeroSellAmount` en `src/errors.rs`, `tests/phase5_tests.rs` (108 tests),
+`tests/phase5_submit_tests.rs` (15 tests), `tests/logging_tests.rs` (6 tests), `src/logging.rs` y `docs/yellowstone-adapter.md`.
 
 | Pieza | Contenido |
 |-------|-----------|
@@ -174,13 +174,25 @@ Decisiones y garantías:
 
 Verificación de esta entrega (honesta): crates.io está bloqueado en el sandbox, así que **no** se ejecutó `cargo` real. Se montó un
 workspace de prueba con `tokio 1.53.3`, `bytes`, `thiserror 2.0.17` y `tracing` **reales** y *mocks* de las crates de Solana,
-`zeroize`, `reqwest` y `serde_json`: `src/monitor/{curve,geyser,exit}.rs`, `builder/{math,sell}.rs` y los **97 tests de
+`zeroize`, `reqwest` y `serde_json`: `src/monitor/{curve,geyser,exit}.rs`, `builder/{math,sell}.rs` y los **108 tests de
 `phase5_tests.rs`** compilan y pasan, y `clippy --all-targets -- -D warnings` sale limpio (con los lints `deny` del crate).
-**Sin verificar con las crates reales:** `monitor/submit.rs` y `tests/phase5_submit_tests.rs` (dependen de `reqwest`/`serde`),
+**Sin verificar con las crates reales:** `monitor/submit.rs`, `src/logging.rs`, `tests/phase5_submit_tests.rs` y `tests/logging_tests.rs` (dependen de `reqwest`/`serde`/`tracing-subscriber`),
 `SellSettings::from_config`, los tamaños reales de `try_compile`, las firmas reales y la función `from_str_const` de `Pubkey`;
 la *feature* `test-util` de tokio como `dev-dependency` (no debería añadir paquetes a `Cargo.lock`, pero hay que confirmarlo con `--locked`).
 
-Recuento esperado tras `cargo test --locked`: 213 (Fases 1-4) + 97 `phase5` + 10 `phase5_submit` = **320**.
+Recuento esperado tras `cargo test --locked`: 213 (Fases 1-4) + 108 `phase5` + 15 `phase5_submit` + 6 `logging` = **342** (la auditoría esperaba ~320 antes de añadir los tests de #29-#31).
+
+### Correcciones de la auditoría 2026-10-22 (`claude/audit-2026-10-22.md`)
+
+| Hallazgo | Estado | Corrección |
+|----------|--------|------------|
+| #28 `Cargo.lock` a mano / sin `cargo` real | **ABIERTO** (no se puede cerrar sin crates.io) | `tracing-subscriber` con `env-filter` añade el paquete `matchers`, que no está en `Cargo.lock` y cuyo checksum no puede inventarse: hay que ejecutar **una vez** `cargo update -w` con red y commitear el lock (no editarlo a mano). Hasta entonces `--locked` fallará. Los 3 gates y el recuento real siguen sin ejecutarse |
+| #29 blockhash caducado | **Corregido** | El canal publica `TimedBlockhash = (Hash, Instant)` (`blockhash_channel`, `stamp_blockhash`); `submit` rechaza con `ExitError::StaleBlockhash` si `elapsed > MAX_BLOCKHASH_AGE` (40 s) **antes** de firmar o enviar. Tests con reloj pausado (límite inclusivo, recuperación al publicar uno nuevo) |
+| #30 sondeo y ventas duplicadas | **Corregido** | Primer `getInflightBundleStatuses` inmediato (el intervalo solo separa consultas). Nuevo `SellOutcome::Unknown` para sondeo agotado, error permanente tras aceptar el bundle y `sendBundle` ambiguo (timeout / reset tras conectar: `JitoError::may_have_been_accepted`). `ExitEngine::report` **no** vende ni reinyecta esos tokens (`EngineSnapshot::tokens_unresolved`); su impacto de precio se mantiene en las cotizaciones `UNRESOLVED_PROJECTION_SLOTS` (160) slots; `resolve_unknown(seq, sold)` los concilia cuando el llamador lee el saldo de la ATA. `Failed` queda solo para fallos definitivos |
+| #31 logging | **Corregido** (lock pendiente, ver #28) | `src/logging.rs`: `EnvFilter`, `info` por defecto (`RUST_LOG` > `LOG_LEVEL`), texto plano sin ANSI. Los logs de `monitor` llevan contadores, secuencias y etiquetas estáticas (`ExitError::label`), nunca claves, firmas, montos ni saldos; test que captura **todos** los niveles y lo comprueba |
+| #32 adaptador Yellowstone | **APLAZADO** (decisión a confirmar por el propietario) | Requiere `tonic`/`prost`; contrato en `docs/yellowstone-adapter.md`. La Fase 5 no cumple aún el objetivo de ingesta real |
+| #33 CI | **Corregido** | Actions fijadas por SHA de commit (`checkout` 4.4.0, `rust-cache` 2.9.3, `install-action` 2.87.30, `gitleaks-action` 2.3.9); `gitleaks-action` no exige licencia en cuentas personales (sí en organizaciones; anotado en el workflow). Falta verlo en verde en GitHub |
+| #34 PROGRESS | **Corregido** | Cabecera, SHAs y matriz sincronizados con el estado real |
 
 Pendiente de la Fase 5: adaptador Yellowstone real (`tonic`), cableado en un `main` con `trigger_on_ctrl_c`, lectura viva del
 saldo de tokens, y las comprobaciones con `cargo` real descritas arriba.
@@ -228,7 +240,7 @@ Detalle en `claude/audit-2026-10-17.md`, `claude/audit-2026-10-17-run2.md` y
 - [x] #22 saldo requerido: `required_balance` + `ensure_funded` (el rent de `Create` se mide en la Fase 4)
 - [ ] #23 `Config::from_env()` en un `fn main()` síncrono antes del runtime de Tokio (documentado en el README)
 - [ ] #24 `MintSigner::from_seed` con `Zeroizing`; #25 `Debug` sin pubkeys; #26 actions por SHA; #27 rustc 1.97.1 y cobertura
-- [ ] Cobertura (`cargo llvm-cov --summary-only`), logging redactado (`tracing-subscriber`, #17, Fase 6)
+- [ ] Cobertura (`cargo llvm-cov --summary-only`); logging (#17/#31): suscriptor con `EnvFilter` añadido en la Fase 5 (pendiente de regenerar `Cargo.lock`), salida estructurada/archivo en la Fase 6
 
 > Nota: la auditoría 2026-10-21 condiciona la Fase 4 a: fusión y gates en `main`, topes #19/#20, `required_balance` (#22)
 > y lectura viva de `Global`/`fee_config` (#21), CI en verde con actions fijadas por SHA, rustc 1.97.1 y cobertura medida.

@@ -13,6 +13,7 @@
 
 use std::collections::VecDeque;
 use std::error::Error;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,15 +30,15 @@ use krypton::builder::math::{
 };
 use krypton::builder::sell::{SellBuilder, SellSettings, DEFAULT_SELL_COMPUTE_UNIT_LIMIT};
 use krypton::builder::{CreateVariant, LaunchAddresses};
-use krypton::errors::{BuilderError, ExitError, MonitorError, StreamErrorKind};
+use krypton::errors::{BuilderError, ExitError, JitoError, MonitorError, StreamErrorKind};
 use krypton::monitor::curve::{
     BondingCurveState, CurveObservation, PriceReference, MIN_BONDING_CURVE_BYTES,
 };
 use krypton::monitor::exit::{
-    order_channel, report_channel, run_sell_executor, ExitEngine, ExitManager, ExitPlan,
-    ExitSettings, ExitTrigger, Position, SellOrder, SellOutcome, SellReport, SellSubmitter,
-    Tranche, EXIT_WINDOW_END_MS, EXIT_WINDOW_START_MS, MAX_LATENESS_MS, MAX_STOP_LOSS_ORDERS,
-    MAX_TRANCHES, ORDER_CHANNEL_CAPACITY,
+    order_channel, report_channel, run_sell_executor, EngineSnapshot, ExitEngine, ExitManager,
+    ExitPlan, ExitSettings, ExitTrigger, Position, SellOrder, SellOutcome, SellReport,
+    SellSubmitter, Tranche, EXIT_WINDOW_END_MS, EXIT_WINDOW_START_MS, MAX_LATENESS_MS,
+    MAX_STOP_LOSS_ORDERS, MAX_TRANCHES, ORDER_CHANNEL_CAPACITY, UNRESOLVED_PROJECTION_SLOTS,
 };
 use krypton::monitor::geyser::{
     AccountUpdate, Backoff, BackoffPolicy, ConnectionState, EventStream, GeyserMonitor,
@@ -2976,4 +2977,482 @@ async fn mocked_stream_drives_the_whole_exit_across_a_reconnection() -> Result<(
         Some(expected.min_sol_output_lamports)
     );
     Ok(())
+}
+
+// --- Unknown outcomes (audit finding #30) -------------------------------------------------------
+
+/// Every token of the position is in exactly one bucket.
+fn accounted(snapshot: &EngineSnapshot) -> u64 {
+    snapshot.tokens_sold
+        + snapshot.tokens_in_flight
+        + snapshot.tokens_unresolved
+        + snapshot.tokens_unsold
+}
+
+fn issue_first(engine: &mut ExitEngine) -> Result<SellOrder, Box<dyn Error>> {
+    assert!(engine.observe(fresh_observation(10)?));
+    Ok(engine
+        .poll(1_000)
+        .orders
+        .first()
+        .copied()
+        .ok_or("first order")?)
+}
+
+fn report(engine: &mut ExitEngine, order: &SellOrder, outcome: SellOutcome) {
+    engine.report(SellReport {
+        sequence: order.sequence,
+        outcome,
+    });
+}
+
+#[test]
+fn an_unknown_outcome_is_neither_sold_nor_carried_forward() -> Result<(), Box<dyn Error>> {
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    assert!(engine.has_unreported());
+    report(&mut engine, &first, SellOutcome::Unknown);
+
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_unresolved, TRANCHE_TOKENS);
+    assert_eq!(snapshot.tokens_sold, 0);
+    assert_eq!(snapshot.tokens_in_flight, 0);
+    assert_eq!(snapshot.tokens_unsold, POSITION - TRANCHE_TOKENS);
+    assert_eq!(accounted(&snapshot), POSITION);
+    assert!(!engine.has_unreported(), "an unknown order is a report");
+
+    // No carry: the next tranches sell their own share only, and the last one
+    // sweeps what is left of the *unallocated* tokens, never the unresolved ones.
+    let mut sold = Vec::new();
+    for elapsed in [4_000, 7_000, 10_000] {
+        let order = engine
+            .poll(elapsed)
+            .orders
+            .first()
+            .copied()
+            .ok_or("later order")?;
+        sold.push(order.plan.token_amount);
+        report(&mut engine, &order, SellOutcome::Landed { slot: 11 });
+    }
+    assert_eq!(
+        sold,
+        vec![TRANCHE_TOKENS, TRANCHE_TOKENS, TRANCHE_TOKENS + 3]
+    );
+    let end = engine.snapshot();
+    assert_eq!(end.tokens_unsold, 0);
+    assert_eq!(end.tokens_unresolved, TRANCHE_TOKENS);
+    assert_eq!(end.tokens_sold, POSITION - TRANCHE_TOKENS);
+    assert_eq!(accounted(&end), POSITION);
+    Ok(())
+}
+
+#[test]
+fn an_unknown_order_is_reported_once() -> Result<(), Box<dyn Error>> {
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+    // Late or duplicate reports for the same order change nothing.
+    report(&mut engine, &first, SellOutcome::Landed { slot: 12 });
+    report(&mut engine, &first, SellOutcome::Failed);
+    report(&mut engine, &first, SellOutcome::Unknown);
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_unresolved, TRANCHE_TOKENS);
+    assert_eq!(snapshot.tokens_sold, 0);
+    assert_eq!(snapshot.tokens_unsold, POSITION - TRANCHE_TOKENS);
+    Ok(())
+}
+
+#[test]
+fn resolving_an_unknown_order_as_sold_counts_it_once() -> Result<(), Box<dyn Error>> {
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+    assert!(engine.resolve_unknown(first.sequence, true));
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_sold, TRANCHE_TOKENS);
+    assert_eq!(snapshot.tokens_unresolved, 0);
+    assert_eq!(snapshot.tokens_unsold, POSITION - TRANCHE_TOKENS);
+    assert_eq!(accounted(&snapshot), POSITION);
+    // Already settled.
+    assert!(!engine.resolve_unknown(first.sequence, true));
+    assert!(!engine.resolve_unknown(first.sequence, false));
+    assert_eq!(engine.snapshot().tokens_sold, TRANCHE_TOKENS);
+    Ok(())
+}
+
+#[test]
+fn resolving_an_unknown_order_as_unsold_offers_it_to_the_next_tranche() -> Result<(), Box<dyn Error>>
+{
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+    assert!(engine.resolve_unknown(first.sequence, false));
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_unresolved, 0);
+    assert_eq!(snapshot.tokens_unsold, POSITION);
+    assert_eq!(accounted(&snapshot), POSITION);
+
+    let second = engine.poll(4_000).orders.first().copied().ok_or("second")?;
+    assert_eq!(second.plan.token_amount, 2 * TRANCHE_TOKENS);
+    // The sale never happened, so it leaves no phantom impact on the quote.
+    let curve = fresh_observation(10)?.state.curve_params();
+    assert_eq!(
+        second.plan,
+        SellPlan::from_token_amount(
+            &curve,
+            2 * TRANCHE_TOKENS,
+            exit_settings().fee_bps,
+            exit_settings().slippage_bps
+        )?
+    );
+    Ok(())
+}
+
+#[test]
+fn only_unresolved_orders_can_be_resolved() -> Result<(), Box<dyn Error>> {
+    let mut engine = engine()?;
+    assert!(!engine.resolve_unknown(0, true), "nothing issued yet");
+    let first = issue_first(&mut engine)?;
+    assert!(
+        !engine.resolve_unknown(first.sequence, true),
+        "still awaiting its report"
+    );
+    report(&mut engine, &first, SellOutcome::Landed { slot: 11 });
+    assert!(
+        !engine.resolve_unknown(first.sequence, false),
+        "landed, not unknown"
+    );
+    assert!(!engine.resolve_unknown(99, true));
+    assert_eq!(engine.snapshot().tokens_sold, TRANCHE_TOKENS);
+    Ok(())
+}
+
+#[test]
+fn an_unresolved_sale_keeps_its_impact_until_it_can_no_longer_land() -> Result<(), Box<dyn Error>> {
+    let settings = exit_settings();
+    let curve = fresh_observation(10)?.state.curve_params();
+    let quote = |curve: &CurveParams| {
+        SellPlan::from_token_amount(
+            curve,
+            TRANCHE_TOKENS,
+            settings.fee_bps,
+            settings.slippage_bps,
+        )
+    };
+
+    // The first sale was quoted on slot 10. At the last slot it may still land,
+    // an observation without its effect is not proof that it failed.
+    for (slot, projected) in [
+        (20, true),
+        (10 + UNRESOLVED_PROJECTION_SLOTS, true),
+        (10 + UNRESOLVED_PROJECTION_SLOTS + 1, false),
+    ] {
+        let mut engine = engine()?;
+        let first = issue_first(&mut engine)?;
+        report(&mut engine, &first, SellOutcome::Unknown);
+        assert!(engine.observe(fresh_observation(slot)?));
+        let second = engine.poll(4_000).orders.first().copied().ok_or("second")?;
+        let expected = if projected {
+            quote(&first.plan.apply_to(&curve)?)?
+        } else {
+            quote(&curve)?
+        };
+        assert_eq!(second.plan, expected, "slot {slot}");
+    }
+    Ok(())
+}
+
+#[test]
+fn the_stop_loss_never_sweeps_unresolved_tokens() -> Result<(), Box<dyn Error>> {
+    let mut engine = engine_with(four_tranches(Some(2_000))?, exit_settings())?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+
+    assert!(engine.observe(observation(11, &crashed_spec(50)?)?));
+    let sweep = engine.poll(1_500).orders.first().copied().ok_or("sweep")?;
+    assert_eq!(sweep.trigger, ExitTrigger::StopLoss);
+    assert_eq!(sweep.plan.token_amount, POSITION - TRANCHE_TOKENS);
+    report(&mut engine, &sweep, SellOutcome::Landed { slot: 12 });
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_unresolved, TRANCHE_TOKENS);
+    assert_eq!(snapshot.tokens_unsold, 0);
+    assert_eq!(accounted(&snapshot), POSITION);
+    Ok(())
+}
+
+#[test]
+fn only_ambiguous_send_failures_are_treated_as_unknown() {
+    assert!(JitoError::Timeout.may_have_been_accepted());
+    let definite = [
+        JitoError::DryRun,
+        JitoError::EmptyBundle,
+        JitoError::RateLimited,
+        JitoError::Unauthorized { status: 401 },
+        JitoError::Api {
+            status: 503,
+            message: String::new(),
+        },
+        JitoError::Rpc {
+            code: -32_602,
+            message: String::new(),
+        },
+        JitoError::InvalidResponse("unexpected"),
+    ];
+    for error in &definite {
+        assert!(!error.may_have_been_accepted(), "{error}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_outcome_through_the_pipeline_is_not_resubmitted() -> Result<(), Box<dyn Error>>
+{
+    let run = start_exit(
+        four_tranches(None)?,
+        vec![Some(SellOutcome::Unknown)],
+        Duration::ZERO,
+        16,
+    )?;
+    run.updates
+        .send(curve_update(10, &post_buy_spec()?))
+        .await?;
+    let recorder = Arc::clone(&run.recorder);
+    let summary = run.finish().await?;
+
+    let tokens: Vec<u64> = recorder.seen()?.iter().map(|entry| entry.tokens).collect();
+    assert_eq!(
+        tokens,
+        vec![
+            TRANCHE_TOKENS,
+            TRANCHE_TOKENS,
+            TRANCHE_TOKENS,
+            TRANCHE_TOKENS + 3
+        ],
+        "the unknown tranche is not repeated"
+    );
+    assert_eq!(summary.position.tokens_unresolved, TRANCHE_TOKENS);
+    assert_eq!(summary.position.tokens_sold, POSITION - TRANCHE_TOKENS);
+    assert_eq!(summary.position.tokens_unsold, 0);
+    assert!(!summary.unsettled);
+    Ok(())
+}
+
+// --- Log hygiene (audit finding #31) -----------------------------------------------------------
+
+/// Records every event at every level, so the checks below hold even when
+/// `RUST_LOG=trace` is set in production.
+#[derive(Default)]
+struct Captured {
+    lines: Mutex<Vec<String>>,
+}
+
+struct Capture(Arc<Captured>);
+
+struct Collect<'a>(&'a mut String);
+
+impl tracing::field::Visit for Collect<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let _ = write!(self.0, " {}={:?}", field.name(), value);
+    }
+}
+
+impl tracing::Subscriber for Capture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = format!("{} {}", event.metadata().level(), event.metadata().target());
+        event.record(&mut Collect(&mut line));
+        if let Ok(mut lines) = self.0.lines.lock() {
+            lines.push(line);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn capture() -> (Arc<Captured>, tracing::subscriber::DefaultGuard) {
+    let captured = Arc::new(Captured::default());
+    let guard = tracing::subscriber::set_default(Capture(Arc::clone(&captured)));
+    (captured, guard)
+}
+
+/// A submitter whose failures carry Block Engine text.
+struct JitoDown;
+
+impl SellSubmitter for JitoDown {
+    async fn submit(&self, _order: &SellOrder) -> Result<SellOutcome, ExitError> {
+        Err(ExitError::Jito(JitoError::Api {
+            status: 503,
+            message: "overloaded".to_owned(),
+        }))
+    }
+}
+
+/// Words that look like a base58 public key or signature (32+ base58 characters).
+fn looks_like_key_material(line: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            word.len() >= 32
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l'))
+        })
+}
+
+#[tokio::test(start_paused = true)]
+async fn logs_never_contain_keys_signatures_amounts_or_balances() -> Result<(), Box<dyn Error>> {
+    let (captured, _guard) = capture();
+
+    // 1. A pipeline with an undecodable update, an unknown outcome, a failed
+    //    submission, a failed-outcome report and a closed update stream.
+    let run = start_exit(
+        four_tranches(None)?,
+        vec![Some(SellOutcome::Unknown), None, Some(SellOutcome::Failed)],
+        Duration::ZERO,
+        16,
+    )?;
+    run.updates
+        .send(StreamUpdate::Account(account_update(
+            5,
+            5,
+            curve_key(),
+            vec![1, 2, 3],
+        )))
+        .await?;
+    run.updates
+        .send(curve_update(10, &post_buy_spec()?))
+        .await?;
+    let ExitRun {
+        updates,
+        manager,
+        executor,
+        recorder,
+        trigger,
+        ..
+    } = run;
+    drop(updates);
+    let _ = manager.await??;
+    trigger.trigger();
+    executor.await?;
+    let seen = recorder.seen()?;
+    assert_eq!(seen.len(), 4);
+
+    // 2. A budget that allows one order: the others are dropped with an error
+    //    that carries lamport amounts in its Display text.
+    let tight = ExitSettings {
+        max_total_cost_lamports: 125_000,
+        ..exit_settings()
+    };
+    let engine = engine_with(four_tranches(None)?, tight)?;
+    // A fresh genesis: the first scenario advanced the paused clock.
+    let manager = ExitManager::new(engine, curve_key(), Instant::now());
+    let (orders_tx, orders_rx) = order_channel();
+    let (reports_tx, reports_rx) = report_channel();
+    let (updates_tx, updates_rx) = mpsc::channel(4);
+    let (trigger, signal) = shutdown_channel();
+    let executor = tokio::spawn(run_sell_executor(
+        Arc::new(JitoDown),
+        orders_rx,
+        reports_tx,
+        signal.clone(),
+        Duration::from_secs(5),
+    ));
+    updates_tx.send(curve_update(10, &post_buy_spec()?)).await?;
+    let summary = manager
+        .run(updates_rx, orders_tx, reports_rx, signal)
+        .await?;
+    trigger.trigger();
+    executor.await?;
+    assert!(summary.position.dropped >= 3);
+
+    // The scenarios must have produced the events the checks are about.
+    let lines = captured.lines.lock().map_err(|_| "poisoned")?.clone();
+    let joined = lines.join("\n");
+    for expected in [
+        "kind=\"budget_exceeded\"",
+        "kind=\"jito_error\"",
+        "sell outcome unknown",
+        "ignoring undecodable bonding curve update",
+        "update stream closed",
+        "exit finished with part of the position not confirmed sold",
+    ] {
+        assert!(
+            joined.contains(expected),
+            "missing event: {expected}\n{joined}"
+        );
+    }
+
+    // Nothing sensitive, at any level.
+    let mut forbidden = vec![
+        curve_key().to_string(),
+        PUMP_PROGRAM_ID.to_string(),
+        POSITION.to_string(),
+        TRANCHE_TOKENS.to_string(),
+        (TRANCHE_TOKENS + 3).to_string(),
+        "125000".to_owned(),
+        "5000000".to_owned(),
+    ];
+    for entry in &seen {
+        forbidden.push(entry.min_out.to_string());
+    }
+    for line in &lines {
+        assert!(!looks_like_key_material(line), "key-like text in: {line}");
+        for secret in &forbidden {
+            assert!(
+                !line.contains(secret.as_str()),
+                "{secret} leaked in: {line}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn error_labels_are_static_and_value_free() {
+    let errors = [
+        ExitError::NoCurveState,
+        ExitError::CurveComplete,
+        ExitError::CashbackCoinUnsupported,
+        ExitError::WindowMissed { tranche: 3 },
+        ExitError::BudgetExceeded {
+            cost: 123_456,
+            remaining: 654_321,
+        },
+        ExitError::OrderChannelClosed,
+        ExitError::OrderChannelFull,
+        ExitError::ArithmeticOverflow { context: "x" },
+        ExitError::StaleBlockhash,
+        ExitError::InvalidPlan { reason: "x" },
+        ExitError::InvalidConfig { reason: "x" },
+        ExitError::Builder(BuilderError::ZeroSellAmount),
+        ExitError::Jito(JitoError::DryRun),
+    ];
+    for error in &errors {
+        let label = error.label();
+        assert!(!label.is_empty());
+        assert!(
+            label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "{label}"
+        );
+    }
+    // The Display text of the budget error carries amounts; the label never does.
+    assert!(ExitError::BudgetExceeded {
+        cost: 123_456,
+        remaining: 654_321
+    }
+    .to_string()
+    .contains("123456"));
+    assert_eq!(
+        ExitError::BudgetExceeded {
+            cost: 123_456,
+            remaining: 654_321
+        }
+        .label(),
+        "budget_exceeded"
+    );
 }

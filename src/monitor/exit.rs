@@ -34,6 +34,16 @@
 //! into the next tranche, so a transient failure delays the exit instead of
 //! silently shrinking it. A tranche that comes due more than
 //! [`MAX_LATENESS_MS`] late, or after the end of the window, is dropped.
+//!
+//! # Unknown outcomes
+//! A bundle that is still unresolved when the polling budget ends may have
+//! landed. Re-offering its tokens would risk a double sell: the duplicate fails
+//! on chain but still costs the tip and the priority fee. An order reported as
+//! [`SellOutcome::Unknown`] is therefore held apart: not sold, not carried
+//! forward. [`EngineSnapshot::tokens_unresolved`] shows it, and
+//! [`ExitEngine::resolve_unknown`] settles it once the caller has read the
+//! token account. Its price impact stays in the quotes for
+//! [`UNRESOLVED_PROJECTION_SLOTS`] slots, after which it can no longer land.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +71,10 @@ pub const MAX_TRANCHES: usize = 10;
 pub const MAX_LATENESS_MS: u64 = 500;
 /// Stop-loss orders one run may issue (the first plus retries after failures).
 pub const MAX_STOP_LOSS_ORDERS: u8 = 3;
+/// Slots after the quoting observation during which an order with an unknown
+/// outcome may still land. A transaction is valid for about 150 slots; the
+/// margin covers clock skew between the observation and the blockhash.
+pub const UNRESOLVED_PROJECTION_SLOTS: u64 = 160;
 
 /// Capacity of [`order_channel`]: strictly more than the most orders one engine
 /// can ever issue (every tranche plus every stop-loss order), so the manager's
@@ -325,8 +339,17 @@ pub enum SellOutcome {
         /// Landing slot.
         slot: u64,
     },
-    /// Did not land (rejected, expired, errored). Its tokens are carried forward.
+    /// Definitely did not land (rejected, errored before submission, reported
+    /// failed or invalid by the Block Engine). Its tokens are carried forward.
     Failed,
+    /// The submission may or may not have landed: the status polling ran out,
+    /// or the send itself timed out after the request left the machine.
+    ///
+    /// The engine neither counts the tokens as sold nor re-offers them: selling
+    /// them again could double-sell and burn tips and priority fees on a
+    /// transaction that fails on chain. They stay *unresolved* until the caller
+    /// reads the token account and calls [`ExitEngine::resolve_unknown`].
+    Unknown,
     /// Dry-run: assembled and signed but deliberately not submitted. Counted as
     /// sold so the schedule can be rehearsed end to end.
     Simulated,
@@ -368,7 +391,10 @@ pub struct EngineSnapshot {
     pub tokens_sold: u64,
     /// Tokens in orders awaiting a report.
     pub tokens_in_flight: u64,
-    /// Tokens neither sold nor in flight.
+    /// Tokens in orders whose outcome is [`SellOutcome::Unknown`]: neither
+    /// counted as sold nor offered again until resolved.
+    pub tokens_unresolved: u64,
+    /// Tokens neither sold, in flight nor unresolved.
     pub tokens_unsold: u64,
     /// Tranches and sweeps dropped.
     pub dropped: u32,
@@ -388,11 +414,25 @@ enum TrancheStatus {
     Superseded,
 }
 
+/// Where an issued order stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlightState {
+    /// No report yet.
+    Awaiting,
+    /// Landed in this slot; kept until an observation reflects it.
+    Landed(u64),
+    /// Outcome unknown; its price impact is kept in the quotes until this slot
+    /// (the order can no longer land after it, so observations tell the truth).
+    Unresolved { until_slot: u64 },
+}
+
 #[derive(Debug, Clone, Copy)]
 struct InFlight {
     sequence: u8,
     plan: SellPlan,
-    landed_slot: Option<u64>,
+    /// Slot of the observation the order was quoted on.
+    quoted_slot: u64,
+    state: FlightState,
 }
 
 /// The synchronous exit state machine. See the module documentation.
@@ -405,6 +445,9 @@ pub struct ExitEngine {
     unallocated: u64,
     carry: u64,
     sold: u64,
+    /// `(sequence, tokens)` of every order reported [`SellOutcome::Unknown`]
+    /// and not yet resolved. At most one entry per order issued.
+    unresolved: Vec<(u8, u64)>,
     in_flight: Vec<InFlight>,
     latest: Option<CurveObservation>,
     next_sequence: u8,
@@ -440,6 +483,7 @@ impl ExitEngine {
             unallocated: position.tokens,
             carry: 0,
             sold: 0,
+            unresolved: Vec::new(),
             in_flight: Vec::new(),
             latest: None,
             next_sequence: 0,
@@ -461,10 +505,10 @@ impl ExitEngine {
             }
         }
         self.latest = Some(observation);
-        self.in_flight.retain(|flight| {
-            flight
-                .landed_slot
-                .is_none_or(|slot| slot > observation.slot)
+        self.in_flight.retain(|flight| match flight.state {
+            FlightState::Awaiting => true,
+            FlightState::Landed(slot) => slot > observation.slot,
+            FlightState::Unresolved { until_slot } => until_slot >= observation.slot,
         });
         true
     }
@@ -481,7 +525,7 @@ impl ExitEngine {
         let Some(flight) = self.in_flight.get(position).copied() else {
             return;
         };
-        if flight.landed_slot.is_some() {
+        if flight.state != FlightState::Awaiting {
             return; // already reported: duplicate reports must not count twice
         }
         let tokens = flight.plan.token_amount;
@@ -494,7 +538,7 @@ impl ExitEngine {
                 if reflected {
                     self.in_flight.remove(position);
                 } else if let Some(entry) = self.in_flight.get_mut(position) {
-                    entry.landed_slot = Some(slot);
+                    entry.state = FlightState::Landed(slot);
                 }
             }
             SellOutcome::Simulated => {
@@ -506,7 +550,42 @@ impl ExitEngine {
                 self.carry = self.carry.saturating_add(tokens);
                 self.in_flight.remove(position);
             }
+            SellOutcome::Unknown => {
+                // Not sold, not re-offered: wait for `resolve_unknown`.
+                self.unresolved.push((report.sequence, tokens));
+                let until_slot = flight
+                    .quoted_slot
+                    .saturating_add(UNRESOLVED_PROJECTION_SLOTS);
+                if let Some(entry) = self.in_flight.get_mut(position) {
+                    entry.state = FlightState::Unresolved { until_slot };
+                }
+            }
         }
+    }
+
+    /// Settles an order that was reported [`SellOutcome::Unknown`], once the
+    /// caller has read the token account. `sold` says whether the tokens left
+    /// the wallet. Returns `false` if `sequence` is not an unresolved order.
+    ///
+    /// Tokens that were not sold are returned to the position and offered to
+    /// the next pending tranche (or to the stop-loss sweep), like a failure.
+    pub fn resolve_unknown(&mut self, sequence: u8, sold: bool) -> bool {
+        let Some(position) = self
+            .unresolved
+            .iter()
+            .position(|(unresolved, _)| *unresolved == sequence)
+        else {
+            return false;
+        };
+        let (_, tokens) = self.unresolved.remove(position);
+        if sold {
+            self.sold = self.sold.saturating_add(tokens);
+        } else {
+            self.unallocated = self.unallocated.saturating_add(tokens);
+            self.carry = self.carry.saturating_add(tokens);
+            self.in_flight.retain(|flight| flight.sequence != sequence);
+        }
+        true
     }
 
     /// Issues every order that is due at `elapsed_ms` after genesis.
@@ -595,7 +674,7 @@ impl ExitEngine {
     pub fn has_unreported(&self) -> bool {
         self.in_flight
             .iter()
-            .any(|flight| flight.landed_slot.is_none())
+            .any(|flight| flight.state == FlightState::Awaiting)
     }
 
     /// Position accounting.
@@ -604,14 +683,19 @@ impl ExitEngine {
         let in_flight_tokens = self
             .in_flight
             .iter()
-            .filter(|flight| flight.landed_slot.is_none())
+            .filter(|flight| flight.state == FlightState::Awaiting)
             .fold(0u64, |sum, flight| {
                 sum.saturating_add(flight.plan.token_amount)
             });
+        let unresolved_tokens = self
+            .unresolved
+            .iter()
+            .fold(0u64, |sum, (_, tokens)| sum.saturating_add(*tokens));
         EngineSnapshot {
             orders_issued: self.orders_issued,
             tokens_sold: self.sold,
             tokens_in_flight: in_flight_tokens,
+            tokens_unresolved: unresolved_tokens,
             tokens_unsold: self.unallocated,
             dropped: self.dropped,
             stop_loss_fired: self.stop_loss_fired,
@@ -781,7 +865,8 @@ impl ExitEngine {
         self.in_flight.push(InFlight {
             sequence,
             plan,
-            landed_slot: None,
+            quoted_slot: observation.slot,
+            state: FlightState::Awaiting,
         });
         Ok(SellOrder {
             sequence,
@@ -934,16 +1019,21 @@ impl ExitManager {
             }
         }
 
+        // Counts and flags only: amounts and balances never reach the logs.
         let snapshot = self.engine.snapshot();
-        if snapshot.tokens_unsold > 0 || snapshot.tokens_in_flight > 0 {
+        if snapshot.tokens_unsold > 0
+            || snapshot.tokens_in_flight > 0
+            || snapshot.tokens_unresolved > 0
+        {
             warn!(
-                unsold = snapshot.tokens_unsold,
-                in_flight = snapshot.tokens_in_flight,
+                orders = snapshot.orders_issued,
+                dropped = snapshot.dropped,
+                unresolved = snapshot.tokens_unresolved > 0,
                 interrupted,
-                "exit finished with part of the position unsold"
+                "exit finished with part of the position not confirmed sold"
             );
         } else {
-            info!(sold = snapshot.tokens_sold, "exit finished");
+            info!(orders = snapshot.orders_issued, "exit finished");
         }
         Ok(ExitSummary {
             position: snapshot,
@@ -987,15 +1077,15 @@ impl ExitManager {
     ) -> Result<(), ExitError> {
         let result = self.engine.poll(elapsed_ms);
         for dropped in &result.dropped {
-            warn!(trigger = ?dropped.trigger, error = %dropped.error, "exit order dropped");
+            warn!(
+                trigger = ?dropped.trigger,
+                kind = dropped.error.label(),
+                "exit order dropped"
+            );
         }
         let mut closed = false;
         for order in result.orders {
-            debug!(
-                sequence = order.sequence,
-                tokens = order.plan.token_amount,
-                "dispatching sell order"
-            );
+            debug!(sequence = order.sequence, "dispatching sell order");
             match orders.try_send(order) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(order)) => {
@@ -1030,7 +1120,9 @@ impl ExitManager {
 pub trait SellSubmitter: Send + Sync + 'static {
     /// Assembles, signs and submits the order, then waits for its outcome.
     ///
-    /// Errors are mapped to [`SellOutcome::Failed`] by the executor.
+    /// Errors are mapped to [`SellOutcome::Failed`] by the executor, so an
+    /// implementation must return `Ok(SellOutcome::Unknown)` (not an error) for
+    /// every case in which the order may already have been accepted.
     fn submit(
         &self,
         order: &SellOrder,
@@ -1062,10 +1154,30 @@ pub async fn run_sell_executor<S: SellSubmitter>(
                         let outcome = match submitter.submit(&order).await {
                             Ok(outcome) => outcome,
                             Err(error) => {
-                                warn!(sequence = order.sequence, %error, "sell submission failed");
+                                // The label never carries amounts; the Block
+                                // Engine text is sanitized by `JitoError`.
+                                match &error {
+                                    ExitError::Jito(detail) => warn!(
+                                        sequence = order.sequence,
+                                        kind = error.label(),
+                                        %detail,
+                                        "sell submission failed"
+                                    ),
+                                    _ => warn!(
+                                        sequence = order.sequence,
+                                        kind = error.label(),
+                                        "sell submission failed"
+                                    ),
+                                }
                                 SellOutcome::Failed
                             }
                         };
+                        if outcome == SellOutcome::Unknown {
+                            warn!(
+                                sequence = order.sequence,
+                                "sell outcome unknown; not resubmitting until the balance is checked"
+                            );
+                        }
                         // The manager may already be gone; nothing else to do then.
                         let _ = reports
                             .send(SellReport { sequence: order.sequence, outcome })

@@ -5,6 +5,7 @@
 //! - [`security`]: zeroizing secret containers and the secure wallet loader.
 //! - [`config`]: strongly-typed configuration loaded from the environment.
 //! - [`parsing`]: dependency-free, allocation-light parsing helpers.
+//! - [`logging`]: the `tracing` subscriber (`info` by default, nothing sensitive).
 //!
 //! Later phases add [`storage`] (Pinata/IPFS metadata), [`builder`] (atomic
 //! `Create` + `Buy` transaction, lookup tables) and [`network`] (Jito Block
@@ -30,6 +31,7 @@
 pub mod builder;
 pub mod config;
 pub mod errors;
+pub mod logging;
 pub mod monitor;
 pub mod network;
 pub mod parsing;

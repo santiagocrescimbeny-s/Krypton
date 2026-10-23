@@ -59,6 +59,10 @@ pub enum LauncherError {
     #[error("exit error: {0}")]
     Exit(#[from] ExitError),
 
+    /// Logging subscriber setup failure.
+    #[error("logging error: {0}")]
+    Logging(#[from] LoggingError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -454,6 +458,27 @@ impl JitoError {
             _ => false,
         }
     }
+
+    /// `true` when a failed `sendBundle` leaves open whether the Block Engine
+    /// accepted the bundle: a timeout, or a connection-level error after the
+    /// connection was established. A refusal to connect, an HTTP status or a
+    /// JSON-RPC error means the bundle was not accepted.
+    ///
+    /// Such a bundle may still land, so its sell must not be repeated blindly.
+    #[must_use]
+    pub fn may_have_been_accepted(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            Self::Transport(source) => {
+                !(source.is_builder()
+                    || source.is_connect()
+                    || source.is_redirect()
+                    || source.is_status()
+                    || source.is_decode())
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Failures while deriving addresses, encoding instructions, or assembling and
@@ -794,6 +819,11 @@ pub enum ExitError {
         context: &'static str,
     },
 
+    /// The cached blockhash is older than the allowed age: the refresher has
+    /// stalled, and a transaction signed with it would expire silently.
+    #[error("the cached blockhash is too old to sign with; the refresher may have stalled")]
+    StaleBlockhash,
+
     /// Sell quoting or transaction assembly failed.
     #[error("sell builder error: {0}")]
     Builder(#[from] BuilderError),
@@ -801,4 +831,41 @@ pub enum ExitError {
     /// Bundle submission failed.
     #[error("Jito error: {0}")]
     Jito(#[from] JitoError),
+}
+
+/// Failures while installing the `tracing` subscriber.
+///
+/// Carries only static text, so it is always safe to log or print.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LoggingError {
+    /// The filter directive (`RUST_LOG`) could not be parsed.
+    #[error("invalid log filter directive")]
+    InvalidFilter,
+
+    /// A global subscriber is already installed.
+    #[error("a global tracing subscriber is already installed")]
+    AlreadyInstalled,
+}
+
+impl ExitError {
+    /// A short, stable, value-free name for the error, safe for logs: unlike
+    /// the `Display` text it never carries amounts, budgets or balances.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::InvalidPlan { .. } => "invalid_plan",
+            Self::InvalidConfig { .. } => "invalid_config",
+            Self::NoCurveState => "no_curve_state",
+            Self::CurveComplete => "curve_complete",
+            Self::CashbackCoinUnsupported => "cashback_unsupported",
+            Self::WindowMissed { .. } => "window_missed",
+            Self::BudgetExceeded { .. } => "budget_exceeded",
+            Self::OrderChannelClosed => "order_channel_closed",
+            Self::OrderChannelFull => "order_channel_full",
+            Self::ArithmeticOverflow { .. } => "arithmetic_overflow",
+            Self::StaleBlockhash => "stale_blockhash",
+            Self::Builder(_) => "builder_error",
+            Self::Jito(_) => "jito_error",
+        }
+    }
 }

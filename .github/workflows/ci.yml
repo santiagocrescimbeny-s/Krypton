@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
 
+# Third-party actions are pinned to a full commit SHA (the tag is in the comment):
+# a moved or hijacked tag cannot change what runs. Update them deliberately.
 # Least privilege: jobs only read the repository.
 permissions:
   contents: read
@@ -23,14 +25,14 @@ jobs:
     name: fmt / check / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The channel is pinned in `rust-toolchain.toml` (1.97.1); rustup honours it,
       # this step only makes sure the toolchain and components are installed.
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -48,10 +50,10 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-audit
 
@@ -63,14 +65,17 @@ jobs:
 
   gitleaks:
     name: gitleaks
+    # gitleaks-action needs a `GITLEAKS_LICENSE` secret only for repositories owned by an
+    # organization; this repository belongs to a personal account. If it moves to an
+    # organization, add the secret or replace this job with the gitleaks CLI.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history: secrets removed from the tree can still live in old commits.
           fetch-depth: 0
 
       - name: Scan for secrets
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

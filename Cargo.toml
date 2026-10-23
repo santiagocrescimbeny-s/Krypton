@@ -47,6 +47,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 # Observability.
 tracing = "0.1"
 tracing-appender = "0.2"
+# `env-filter` gives `EnvFilter` (RUST_LOG). Default features are off: no ANSI colours,
+# no `log` bridge. NOTE: `env-filter` pulls in `matchers`, which is not yet in
+# `Cargo.lock`: regenerate the lockfile once (`cargo update -w`) and commit it.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 
 [package]
 name = "krypton"
@@ -75,6 +79,7 @@ bytes = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # `#[tokio::test(start_paused = true)]` needs `test-util`. Feature unification only

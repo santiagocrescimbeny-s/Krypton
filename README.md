@@ -24,6 +24,7 @@ src/
   monitor/                 Fase 5: geyser (supervisor del stream), curve, exit (motor de salida por tramos), submit (Jito)
   builder/sell.rs          Fase 5: SellBuilder (sell_v3 firmado)
   docs/yellowstone-adapter.md  Contrato del adaptador gRPC de Yellowstone
+  logging.rs               Fase 5: suscriptor `tracing` con `EnvFilter` (`info` por defecto, sin datos sensibles)
   monitor/                 andamiaje para la fase 5
 tests/phase1_tests.rs      pruebas de wallet, zeroize y configuración
 tests/phase2_tests.rs      pruebas del motor de metadatos (servidor HTTP simulado)

@@ -4,8 +4,10 @@
 //! - Tests return `Result` and use `?` / `matches!`; no `unwrap()` / `expect()`.
 //! - The Block Engine is the in-process, std-only HTTP server in `tests/common`
 //!   (ephemeral loopback port); nothing leaves the machine.
-//! - These tests run on the real clock with a 1 ms polling interval: a paused
-//!   Tokio clock would auto-advance while the runtime waits on loopback I/O.
+//! - Tests that talk to the server run on the real clock with a 1 ms polling
+//!   interval: a paused Tokio clock would auto-advance while the runtime waits
+//!   on loopback I/O. Only tests that never touch the network (stale-blockhash
+//!   checks, dry-run) pause the clock to age a blockhash.
 //! - Signatures are deterministic (Ed25519), so the exact payload that reaches
 //!   the server can be compared with an independently built transaction.
 
@@ -21,7 +23,9 @@ use krypton::builder::sell::{SellBuilder, SellSettings};
 use krypton::builder::{CreateVariant, CurveParams};
 use krypton::errors::{BuilderError, ExitError};
 use krypton::monitor::exit::{ExitTrigger, SellOrder, SellOutcome, SellSubmitter};
-use krypton::monitor::submit::JitoSellSubmitter;
+use krypton::monitor::submit::{
+    blockhash_channel, stamp_blockhash, JitoSellSubmitter, TimedBlockhash, MAX_BLOCKHASH_AGE,
+};
 use krypton::network::jito::{
     encode_base64, serialize_transaction, JitoClient, JitoTip, JITO_TIP_ACCOUNTS,
 };
@@ -108,7 +112,7 @@ fn method_of(request: &RecordedRequest) -> Result<String, Box<dyn Error>> {
 
 struct Fixture {
     submitter: JitoSellSubmitter,
-    blockhash: watch::Sender<Hash>,
+    blockhash: watch::Sender<TimedBlockhash>,
     wallet: Arc<SecureWallet>,
     builder: SellBuilder,
 }
@@ -120,7 +124,7 @@ fn fixture(server: &MockServer, dry_run: bool, max_polls: u32) -> Result<Fixture
         JitoClient::new(&Url::parse(&server.url())?, dry_run)?
             .with_retries(0, Duration::from_millis(1)),
     );
-    let (blockhash, receiver) = watch::channel(Hash::new_from_array([3u8; 32]));
+    let (blockhash, receiver) = blockhash_channel(Hash::new_from_array([3u8; 32]));
     let submitter = JitoSellSubmitter::new(
         client,
         builder.clone(),
@@ -208,7 +212,7 @@ async fn each_order_uses_the_freshest_blockhash() -> TestResult {
     fixture.submitter.submit(&order).await?;
     fixture
         .blockhash
-        .send(Hash::new_from_array([4u8; 32]))
+        .send(stamp_blockhash(Hash::new_from_array([4u8; 32])))
         .map_err(|_| "receiver dropped")?;
     fixture.submitter.submit(&order).await?;
 
@@ -261,12 +265,14 @@ async fn failed_and_invalid_bundles_are_reported_as_failed() -> TestResult {
 }
 
 #[tokio::test]
-async fn an_unresolved_bundle_is_failed_after_the_polling_budget() -> TestResult {
+async fn an_unresolved_bundle_is_unknown_not_failed_after_the_polling_budget() -> TestResult {
     let server = scripted(vec![status_reply("Pending", Value::Null)])?;
     let fixture = fixture(&server, false, 4)?;
+    // The bundle may still land: reporting Failed would let the engine sell the
+    // same tokens again and burn a second tip.
     assert_eq!(
         fixture.submitter.submit(&order()?).await?,
-        SellOutcome::Failed
+        SellOutcome::Unknown
     );
     assert_eq!(server.request_count(), 1 + 4);
 
@@ -277,9 +283,35 @@ async fn an_unresolved_bundle_is_failed_after_the_polling_budget() -> TestResult
     let fixture = fixture(&server, false, 2)?;
     assert_eq!(
         fixture.submitter.submit(&order()?).await?,
-        SellOutcome::Failed
+        SellOutcome::Unknown
     );
     assert_eq!(server.request_count(), 1 + 2);
+
+    // No polling budget at all: nothing is known either.
+    let server = scripted(vec![])?;
+    let fixture = fixture(&server, false, 0)?;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Unknown
+    );
+    assert_eq!(server.request_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_first_status_check_is_immediate() -> TestResult {
+    let server = scripted(vec![status_reply("Landed", json!(42u64))])?;
+    let mut fixture = fixture(&server, false, 3)?;
+    // An hour between checks: any sleep before the first one would time out.
+    fixture.submitter = fixture
+        .submitter
+        .with_polling(Duration::from_secs(3_600), 3);
+    let order = order()?;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), fixture.submitter.submit(&order))
+        .await
+        .map_err(|_| "the first status check waited for the polling interval")??;
+    assert_eq!(outcome, SellOutcome::Landed { slot: 42 });
+    assert_eq!(server.request_count(), 2);
     Ok(())
 }
 
@@ -299,17 +331,38 @@ async fn transient_status_errors_are_retried_until_resolved() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_permanent_status_error_aborts_the_submission() -> TestResult {
+async fn a_permanent_status_error_after_the_send_is_unknown_not_an_error() -> TestResult {
     let server = scripted(vec![MockResponse::json(400, "{}")])?;
     let fixture = fixture(&server, false, 6)?;
-    let result = fixture.submitter.submit(&order()?).await;
-    assert!(matches!(result, Err(ExitError::Jito(_))), "{result:?}");
+    // The Block Engine already accepted the bundle. An error here must not turn
+    // into Failed (the executor maps errors to Failed, and the tokens would be resold).
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Unknown
+    );
     assert_eq!(server.request_count(), 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_failed_send_is_not_retried() -> TestResult {
+async fn a_send_that_times_out_is_unknown() -> TestResult {
+    let server =
+        MockServer::start(|_, _| rpc_ok(&json!(BUNDLE_ID)).delayed(Duration::from_millis(800)))?;
+    let wallet = Arc::new(wallet(1)?);
+    let client = Arc::new(
+        JitoClient::new(&Url::parse(&server.url())?, false)?
+            .with_retries(0, Duration::from_millis(1))
+            .with_timeout(Duration::from_millis(100)),
+    );
+    let (_blockhash, receiver) = blockhash_channel(Hash::new_from_array([3u8; 32]));
+    let submitter = JitoSellSubmitter::new(client, builder_for(&wallet)?, wallet, receiver, tip()?);
+    // The request may have reached the Block Engine: do not report a failure.
+    assert_eq!(submitter.submit(&order()?).await?, SellOutcome::Unknown);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_definite_send_rejection_is_an_error() -> TestResult {
     let server = MockServer::start(|_, _| MockResponse::json(503, "busy"))?;
     let fixture = fixture(&server, false, 6)?;
     let result = fixture.submitter.submit(&order()?).await;
@@ -327,7 +380,7 @@ async fn a_foreign_wallet_is_refused_before_any_request() -> TestResult {
     let server = scripted(vec![])?;
     let mut fixture = fixture(&server, false, 3)?;
     let stranger = Arc::new(wallet(9)?);
-    let (_blockhash, receiver) = watch::channel(Hash::new_from_array([3u8; 32]));
+    let (_blockhash, receiver) = blockhash_channel(Hash::new_from_array([3u8; 32]));
     let client = Arc::new(
         JitoClient::new(&Url::parse(&server.url())?, false)?
             .with_retries(0, Duration::from_millis(1)),
@@ -340,6 +393,65 @@ async fn a_foreign_wallet_is_refused_before_any_request() -> TestResult {
         "{result:?}"
     );
     assert_eq!(server.request_count(), 0);
+    Ok(())
+}
+
+// --- Blockhash freshness (audit finding #29) -----------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_stale_blockhash_is_refused_before_anything_is_signed_or_sent() -> TestResult {
+    let server = scripted(vec![])?;
+    let fixture = fixture(&server, false, 3)?;
+    tokio::time::sleep(MAX_BLOCKHASH_AGE + Duration::from_millis(1)).await;
+
+    let result = fixture.submitter.submit(&order()?).await;
+    assert!(
+        matches!(result, Err(ExitError::StaleBlockhash)),
+        "{result:?}"
+    );
+    assert_eq!(server.request_count(), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_age_limit_is_forty_seconds_inclusive() -> TestResult {
+    assert_eq!(MAX_BLOCKHASH_AGE, Duration::from_secs(40));
+    // Dry-run: the whole path is exercised without touching the network.
+    let server = scripted(vec![])?;
+    let fixture = fixture(&server, true, 3)?;
+
+    tokio::time::sleep(MAX_BLOCKHASH_AGE).await;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Simulated
+    );
+
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let result = fixture.submitter.submit(&order()?).await;
+    assert!(
+        matches!(result, Err(ExitError::StaleBlockhash)),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn publishing_a_new_blockhash_unblocks_the_submitter() -> TestResult {
+    let server = scripted(vec![])?;
+    let fixture = fixture(&server, true, 3)?;
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let stale = fixture.submitter.submit(&order()?).await;
+    assert!(matches!(stale, Err(ExitError::StaleBlockhash)), "{stale:?}");
+
+    // The refresher is back.
+    fixture
+        .blockhash
+        .send(stamp_blockhash(Hash::new_from_array([5u8; 32])))
+        .map_err(|_| "receiver dropped")?;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Simulated
+    );
     Ok(())
 }
 
