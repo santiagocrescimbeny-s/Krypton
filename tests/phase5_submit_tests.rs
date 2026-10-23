@@ -468,3 +468,19 @@ fn the_submitter_debug_output_never_contains_key_material() -> TestResult {
     assert!(!text.contains("keypair") && !text.contains("secret"));
     Ok(())
 }
+
+// --- Log hygiene (audit finding #31) -------------------------------------------------------------
+
+#[test]
+fn the_submitter_never_logs_the_bundle_id() {
+    // The bundle id is derived from the transaction signatures.
+    let source = include_str!("../src/monitor/submit.rs");
+    assert!(
+        !source.contains("bundle = %"),
+        "a log field carries the bundle id"
+    );
+    assert!(
+        !source.contains("bundle = ?"),
+        "a log field carries the bundle id"
+    );
+}

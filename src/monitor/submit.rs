@@ -179,7 +179,8 @@ impl SellSubmitter for JitoSellSubmitter {
             }
             Err(error) => return Err(error.into()),
         };
-        debug!(sequence = order.sequence, bundle = %bundle_id, "sell bundle submitted");
+        // The bundle id is derived from the transaction signatures: never logged.
+        debug!(sequence = order.sequence, "sell bundle submitted");
 
         for attempt in 0..self.max_polls {
             // The first check is immediate; the interval separates later ones.

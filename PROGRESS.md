@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-24 · Base: `main` = Fases 1-7 (Fase 7 fusionada desde `phase7-live-trading`, `850463a`; 452 tests en Windows, 453 en Linux)
+Última actualización: 2026-10-24 · Rama `audit-hardening-fixes` (desde `main` `9c00e18`): parches de auditoría #29, #30, #31 en revisión · Base: `main` = Fases 1-7 (Fase 7 fusionada desde `phase7-live-trading`, `850463a`; 452 tests en Windows, 453 en Linux)
 
 ## Hoja de ruta
 
@@ -279,6 +279,25 @@ Límites conocidos (no ocultos):
 Recuento tras `cargo test --locked`: 390 + 63 `phase7` = **453** en Linux (452 en Windows, sin el test `#[cfg(unix)]`).
 
 Pendiente tras la Fase 7: adaptador `tonic`, *feed* del suelo de tips y un `main` que cablee todo detrás de la barrera.
+
+## Parches de auditoría #29, #30, #31 (rama `audit-hardening-fixes`, EN REVISIÓN)
+
+Origen: `claude/audit-2026-10-22.md`. Al revisar el código de `main` (`9c00e18`) los tres hallazgos **ya estaban implementados** (Fase 5, correcciones del
+22/10) y la auditoría del 23/10 los da por cerrados; esta rama los **re-verifica** y cierra el único resto encontrado.
+
+| Hallazgo | Estado en el código | Tests que lo cubren |
+|----------|--------------------|---------------------|
+| #29 blockhash caducado | `TimedBlockhash = (Hash, Instant)`; `MAX_BLOCKHASH_AGE = 40 s`; `JitoSellSubmitter::fresh_blockhash` (y el equivalente en `execution/live.rs`) devuelve `ExitError::StaleBlockhash` si `elapsed() > 40 s`, antes de firmar o enviar. `ExitError::StaleBlockhash` existe en `errors.rs` (etiqueta `stale_blockhash`) | `phase5_submit_tests.rs`: `a_stale_blockhash_is_refused_…`, `the_age_limit_is_forty_seconds_inclusive` (40 s pasa, 40 s + 1 ms se rechaza), `publishing_a_new_blockhash_unblocks_the_submitter`; `phase7_tests.rs`: `a_stale_blockhash_stops_a_sell_before_anything_is_reserved` |
+| #30 sondeo y resultado desconocido | El primer sondeo es inmediato (`if attempt > 0 { sleep }`); agotar el presupuesto, un envío ambiguo o un error permanente de estado dan `SellOutcome::Unknown`, nunca `Failed`. En `ExitEngine`, `Unknown` queda **retenido** (ni vendido ni arrastrado al siguiente tramo) hasta que el llamador lee el ATA y llama a `resolve_unknown(sequence, sold)` (la lectura viva del saldo aún no está cableada: pendiente junto al `main`) | `phase5_submit_tests.rs`: `the_first_status_check_is_immediate`, `an_unresolved_bundle_is_unknown_not_failed_…`, etc.; `phase5_tests.rs`: `an_unknown_outcome_is_neither_sold_nor_carried_forward`, `an_unknown_order_is_reported_once`, `resolving_an_unknown_order_as_sold_counts_it_once` |
+| #31 suscriptor y logs seguros | `logging.rs`: `tracing-subscriber` con `env-filter`, nivel `info` por defecto (`RUST_LOG` lo sustituye), sin rutas de módulo ni ANSI; los eventos solo llevan contadores, secuencias y etiquetas | `logging_tests.rs`; `phase5_tests.rs::logs_never_contain_keys_signatures_amounts_or_balances`; `phase6_tests.rs::simulation_logs_carry_no_keys_signatures_or_amounts` |
+
+Cambio nuevo de esta rama (resto de #31, relacionado con #42 de la auditoría 2026-10-23): `JitoSellSubmitter::submit` registraba el `bundle_id`
+(derivado de las firmas) en un `debug!`; ahora solo registra la secuencia. Test de rastreo de fuente: `the_submitter_never_logs_the_bundle_id`.
+
+No tocado a propósito: `tracing-appender` (dependencia sin uso, #42) — quitarla exige regenerar `Cargo.lock` con `cargo` real, y el lockfile no debe editarse a mano.
+
+Verificación: `cargo` real **no** se ejecutó (crates.io bloqueado en el sandbox); el cambio es de una línea de `src/monitor/submit.rs` y un test. Pendiente: los tres gates
+(`cargo check --all-targets --locked`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`) en local/CI. Recuento esperado: 453 + 1 = **454** (Linux).
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 
