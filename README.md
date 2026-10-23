@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) en curso en `phase7-live-trading`. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) completada y verificada en `main`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 

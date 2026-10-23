@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-23 · Base: `main` (`0291190`) = Fases 1-6 (CI verde según el propietario: 390 tests); rama `phase7-live-trading` (desde `0291190`): Fase 7 en curso
+Última actualización: 2026-10-24 · Base: `main` = Fases 1-7 (Fase 7 fusionada desde `phase7-live-trading`, `850463a`; 452 tests en Windows, 453 en Linux)
 
 ## Hoja de ruta
 
@@ -12,7 +12,7 @@
 | 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | ✅ **COMPLETED & VERIFIED** (213 tests en `main` según el propietario; fusionada en `26d4ecf`) |
 | 5 | Monitor Yellowstone gRPC + gestor de salida | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`94eae34`); hallazgos #28-#34 de la auditoría 2026-10-22 resueltos salvo #32 (adaptador `tonic`, aplazado); CI verde según el propietario: 342 tests, `cargo clippy -D warnings` y `cargo audit` |
 | 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`0291190`); CI verde según el propietario: 390 tests |
-| 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | 🟡 **IN PROGRESS** — `phase7-live-trading`: código y tests escritos; verificación con `cargo` real pendiente (ver «Fase 7») |
+| 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` desde `phase7-live-trading` (`850463a`); `cargo check`/`clippy -D warnings`/`test --locked` con las crates reales: 452 tests en Windows (el test de permisos `#[cfg(unix)]` se verifica en el CI de Linux) |
 
 ## Fase 1 — completada y verificada
 
@@ -243,7 +243,7 @@ Recuento esperado tras `cargo test --locked`: 342 (hasta la Fase 5) + 48 `phase6
 Pendiente de la Fase 6: correr los tres gates con `cargo` real, regenerar `Cargo.lock` solo si hiciera falta (no debería), y decidir
 si el binario `main` expone un subcomando `simulate` (hoy el harness es una librería) y si se añade salida estructurada/archivo.
 
-## Fase 7 — Trading en vivo e integración con mainnet (IN PROGRESS)
+## Fase 7 — Trading en vivo e integración con mainnet (COMPLETED & VERIFIED)
 
 Rama `phase7-live-trading` (desde `main` `0291190`). Código nuevo: `src/execution/{mod,settings,gate,guards,tip,live}.rs`,
 `GuardError`, `LiveError`, `LauncherError::Live` y `ExitError::GuardRejected` en `src/errors.rs`, `tests/phase7_tests.rs` (63 tests).
@@ -263,12 +263,11 @@ definitivo de envío → *release*; un envío ambiguo (timeout) → `Unknown`, n
 
 Estado de seguridad: sin `unwrap`/`expect`/`panic!`/`unsafe`/`println!` en `src/execution` (test de rastreo de fuentes). Ningún test abre sockets.
 
-Verificación de esta entrega (honesta): crates.io sigue bloqueado, así que **no** se ejecutó `cargo` real ni `--locked`. En el *workspace* de prueba
-(tokio, bytes, thiserror y tracing reales; *mocks* de Solana, `zeroize`, `reqwest` y `serde_json`, y *stubs* de `config`, `security` y `network`) compilan
-`src/execution/*` y pasan los **63 tests de `phase7_tests.rs`**, más los 108 de `phase5_tests.rs` y los 48 de `phase6_tests.rs`;
-`clippy --all-targets -- -D warnings` limpio. **Sin verificar con las crates reales:** los cambios de `src/config.rs` (los tests de `Config::from_vars` en
-`phase7_tests.rs` se ejecutaron contra un *stub*), el `impl BlockEngine for JitoClient`, el comportamiento real de permisos de archivo, `tests/phase1_tests.rs`
-(aserción 16 → 21) y el rustfmt de `src/` completo.
+Verificación (2026-10-24, crates reales de crates.io, `Cargo.lock` sin cambios) sobre `850463a` en Windows: `cargo fmt --check`,
+`cargo check --all-targets --locked` y `cargo clippy --all-targets --locked -- -D warnings` limpios; `cargo test --locked` **452 tests, 0 fallos**
+(5 repeticiones completas sin fallos intermitentes). Quedan así verificados con las crates reales los cambios de `src/config.rs` (`Config::from_vars`),
+el `impl BlockEngine for JitoClient`, `tests/phase1_tests.rs` (aserción 16 → 21) y el rustfmt de `src/`. `phase7_tests.rs` aporta 62 tests en Windows:
+el 63.º, `keypair_file_must_be_private_and_not_a_symlink` (permisos `0600` y *symlinks*), es `#[cfg(unix)]` y solo corre en el CI de Linux.
 
 Límites conocidos (no ocultos):
 
@@ -277,9 +276,9 @@ Límites conocidos (no ocultos):
 - **Saldo y *blockhash* vivos:** `LaunchRequest` recibe el saldo disponible y el *blockhash*; leerlos del RPC corresponde al `main` que cablee el binario.
 - Sin prueba contra mainnet/devnet real: el Block Engine está simulado en la frontera `BlockEngine`.
 
-Recuento esperado tras `cargo test --locked`: 390 + 63 `phase7` = **453**.
+Recuento tras `cargo test --locked`: 390 + 63 `phase7` = **453** en Linux (452 en Windows, sin el test `#[cfg(unix)]`).
 
-Pendiente de la Fase 7: correr los tres gates con `cargo` real, adaptador `tonic`, *feed* del suelo de tips y un `main` que cablee todo detrás de la barrera.
+Pendiente tras la Fase 7: adaptador `tonic`, *feed* del suelo de tips y un `main` que cablee todo detrás de la barrera.
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 
