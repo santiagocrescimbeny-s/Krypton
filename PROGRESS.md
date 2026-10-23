@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-24 · Rama `mainnet-production-bridge` (puente de producción **en revisión**, sin `cargo` real: ver «Puente de producción») · Base: `main` `e8b3e88` = Fases 1-8 (núcleo) + parches de auditoría #29/#30/#31, verificados por el propietario con `cargo` real (519 tests en Windows, 520 esperados en Linux) · Pendiente del enlace `tonic` (feature `grpc`, sin compilar) y de la prueba contra un endpoint real
+Última actualización: 2026-10-24 · `main` = Fases 1-8 (núcleo) + parches de auditoría #29/#30/#31 + puente de producción (fusionado desde `mainnet-production-bridge`, `a20d423`), verificados con `cargo` real (577 tests en Windows, 581 esperados en Linux) · Pendiente del enlace `tonic` (feature `grpc`, sin compilar) y de la prueba contra un endpoint real
 
 ## Hoja de ruta
 
@@ -14,7 +14,7 @@
 | 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`0291190`); CI verde según el propietario: 390 tests |
 | 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` desde `phase7-live-trading` (`850463a`); `cargo check`/`clippy -D warnings`/`test --locked` con las crates reales: 452 tests en Windows (el test de permisos `#[cfg(unix)]` se verifica en el CI de Linux) |
 | 8 | Adaptador Yellowstone gRPC y feed de tips de Jito | ✅ **COMPLETED & VERIFIED** — núcleo del adaptador y feed de tips fusionados en `main` desde `phase8-yellowstone-adapter` (`6523991`) y verificados con `cargo` real (`check`/`clippy -D warnings`/`test --locked`: 518 tests en Windows), más los parches #29/#30/#31 (519). Incluye la preparación del cableado real: `YellowstoneLink`/`YellowstoneSession`, `UnavailableLink` y el enlace `tonic` de referencia tras la *feature* `grpc`. **Salvedad explícita:** el enlace `tonic` no se ha compilado nunca y no hay prueba de humo contra un endpoint real (ver «Puente de producción») |
-| Puente | Binario `krypton`: configuración de producción, `main`, barrera dry→live del proceso, actualizador de `TipBook`, fuente de blockhash | 🟡 **EN REVISIÓN** — rama `mainnet-production-bridge`; la lógica (`app.rs`, `production.rs`, `runner.rs`, `main.rs`) se compiló y probó en un arnés sin `cargo` real (con *stubs* de `Config`/`logging`/red); `config.rs` real, `rpc.rs` y `grpc.rs` **no se han compilado** |
+| Puente | Binario `krypton`: configuración de producción, `main`, barrera dry→live del proceso, actualizador de `TipBook`, fuente de blockhash | 🟡 **FUSIONADO Y VERIFICADO (gates)** — fusionado en `main` desde `mainnet-production-bridge` (`a20d423`); `cargo check`/`clippy -D warnings`/`test --locked` con las crates reales: 577 tests en Windows (incluye `config.rs`, `rpc.rs`, `main.rs` y los 13 de `bridge_config_tests`). **Salvedad:** `grpc.rs` (*feature* `grpc`) sigue sin compilar y no hay prueba de humo contra endpoints reales |
 
 ## Fase 1 — completada y verificada
 
@@ -353,9 +353,9 @@ y `cargo test --locked` en verde: **518 tests**, 0 fallos (452 previos + 51 `pha
 `tip_http.rs` y `phase8_http_tests.rs` quedan así compilados y probados con `reqwest`/`serde_json` reales. Fusionada en `main` por *fast-forward*.
 
 Pendiente de la Fase 8 (traspasado al puente de producción): (1) ~~los tres gates con `cargo` real~~ hecho; (2) enlace `tonic`: ahora existe una versión de referencia en `src/network/grpc.rs` tras la *feature* `grpc`, **nunca compilada**; añadir las dependencias y regenerar `Cargo.lock` donde crates.io sea alcanzable (pasos en `docs/yellowstone-adapter.md`);
-(3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada); (4) ~~un `main`~~ escrito en el puente de producción (sin compilar). `ENV_KEYS` sigue en 21: las variables nuevas viven en `PRODUCTION_ENV_KEYS`.
+(3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada); (4) ~~un `main`~~ escrito en el puente de producción (compilado y verificado con `cargo` real). `ENV_KEYS` sigue en 21: las variables nuevas viven en `PRODUCTION_ENV_KEYS`.
 
-## Puente de producción a mainnet (rama `mainnet-production-bridge`, EN REVISIÓN)
+## Puente de producción a mainnet (fusionado en `main` desde `mainnet-production-bridge`; gates verificados)
 
 Base: `main` `e8b3e88`. `Cargo.lock` **no** se toca; `Cargo.toml` solo gana la *feature* vacía `grpc` (sin dependencias). `ENV_KEYS` sigue en **21** (el test de `phase1` no cambia):
 las cinco variables nuevas están en `PRODUCTION_ENV_KEYS`.
@@ -402,9 +402,15 @@ fondos reales hacen falta `--live --confirm-live <FRASE>` **y** todo el entorno 
 
 Recuento esperado tras `cargo test --locked` (a confirmar): Linux 520 + 48 + 13 = **581**; Windows 519 + 45 + 13 = **577** (los 3 tests de permisos/*symlink* son `#[cfg(unix)]`).
 
+**Verificación con `cargo` real (2026-10-24, Windows, sobre `a20d423`):** `cargo check --all-targets --locked`, `cargo clippy --all-targets --locked -- -D warnings`
+y `cargo test --locked` en verde sin cambios de código: **577 tests**, 0 fallos (519 previos + 45 `bridge_tests` + 13 `bridge_config_tests`), exactamente el recuento esperado.
+Quedan así compilados y probados con las crates reales `src/config.rs`, `src/network/rpc.rs`, el `main.rs` completo, `tests/bridge_config_tests.rs` y el cambio de `env_hygiene_tests.rs`.
+**No cubierto por estos gates:** `src/network/grpc.rs` (la *feature* `grpc` está desactivada por defecto y no declara dependencias), los 3 tests `#[cfg(unix)]` (CI de Linux)
+y cualquier ejecución contra endpoints reales. Fusionado en `main` por *fast-forward*.
+
 ### Pendiente
 
-1. Los tres gates con `cargo` real; corregir lo que salga de los archivos sin compilar.
+1. ~~Los tres gates con `cargo` real~~ hecho (577 en Windows); queda confirmar 581 en el CI de Linux.
 2. Enlace `tonic`: añadir `yellowstone-grpc-proto`, `tonic` y `tokio-stream`, regenerar `Cargo.lock`, `cargo audit`, compilar con `--features grpc` y ajustar `grpc.rs` (pasos en `docs/yellowstone-adapter.md`).
 3. Prueba de humo en **dry** contra un endpoint Yellowstone real (cuenta de la curva, *ping*, caída forzada) y contra el `tip_floor` real, antes de cualquier ejecución en vivo.
 4. Sin cablear: el *launch* desde el binario; la lectura del ATA para `ExitEngine::resolve_unknown` (por eso el código de salida 3); `Global`/`fee_config` en vivo (#21).
