@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-24 · Base: `main` = Fases 1-7 (Fase 7 fusionada desde `phase7-live-trading`, `850463a`; 452 tests en Windows, 453 en Linux)
+Última actualización: 2026-10-24 · Rama `phase8-yellowstone-adapter` (desde `main` `9c00e18`): Fase 8 en curso · Base: `main` = Fases 1-7 (Fase 7 fusionada desde `phase7-live-trading`, `850463a`; 452 tests en Windows, 453 en Linux)
 
 ## Hoja de ruta
 
@@ -13,6 +13,7 @@
 | 5 | Monitor Yellowstone gRPC + gestor de salida | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`94eae34`); hallazgos #28-#34 de la auditoría 2026-10-22 resueltos salvo #32 (adaptador `tonic`, aplazado); CI verde según el propietario: 342 tests, `cargo clippy -D warnings` y `cargo audit` |
 | 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`0291190`); CI verde según el propietario: 390 tests |
 | 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` desde `phase7-live-trading` (`850463a`); `cargo check`/`clippy -D warnings`/`test --locked` con las crates reales: 452 tests en Windows (el test de permisos `#[cfg(unix)]` se verifica en el CI de Linux) |
+| 8 | Adaptador Yellowstone gRPC y feed de tips de Jito | 🟡 **IN PROGRESS** — `phase8-yellowstone-adapter`: núcleo del adaptador, feed de tips y tests escritos; **falta el enlace `tonic`** (bloqueado: requiere cambiar `Cargo.lock`) y la verificación con `cargo` real (ver «Fase 8») |
 
 ## Fase 1 — completada y verificada
 
@@ -279,6 +280,53 @@ Límites conocidos (no ocultos):
 Recuento tras `cargo test --locked`: 390 + 63 `phase7` = **453** en Linux (452 en Windows, sin el test `#[cfg(unix)]`).
 
 Pendiente tras la Fase 7: adaptador `tonic`, *feed* del suelo de tips y un `main` que cablee todo detrás de la barrera.
+
+## Fase 8 — Adaptador Yellowstone gRPC y feed de tips de Jito (IN PROGRESS)
+
+Rama `phase8-yellowstone-adapter` (desde `main` `9c00e18`). Código nuevo: `src/network/yellowstone.rs`, `src/execution/tip_feed.rs`,
+`src/execution/tip_http.rs`; `YellowstoneError`, `TipFeedError` (y sus variantes en `LauncherError`) en `src/errors.rs`; `tests/phase8_tests.rs` (51 tests) y
+`tests/phase8_http_tests.rs` (15 tests). **`Cargo.toml` y `Cargo.lock` no se tocan.**
+
+### Decisión sobre `tonic` (bloqueo explícito)
+
+`tonic`, `prost` y `yellowstone-grpc-proto` no están en `Cargo.lock` y crates.io es inalcanzable desde el sandbox; añadirlos exige regenerar el
+lockfile con `cargo`, y el lockfile no se edita a mano (ver hallazgo #28). Por eso el adaptador se divide en dos:
+
+| Parte | Estado |
+|-------|--------|
+| **Núcleo** (`network/yellowstone.rs`): `YellowstoneTransport` (implementa `StreamTransport`), `YellowstoneStream` (implementa `EventStream`), `build_wire_request`, `convert_message`, `classify_grpc_code`, `YellowstoneSettings` | ✅ escrito y probado (sin red) |
+| **Enlace** (`YellowstoneLink` / `YellowstoneSession`): `GeyserGrpcClient` de `tonic`, TLS, cabecera `x-token`, copia campo a campo entre los mensajes protobuf y `WireRequest`/`WireMessage` | ⬜ **pendiente**: ~100 líneas, lista de pasos en `docs/yellowstone-adapter.md` («Binding checklist») |
+
+Los tipos `Wire*` son espejos en Rust puro de los campos protobuf que usa el pipeline, de modo que toda decisión (qué instrucciones se conservan, resolución de
+direcciones de tablas de búsqueda v0, respuesta a *pings*, clasificación de errores gRPC para decidir reintentos) vive en código que compila y se prueba sin `tonic`.
+
+### Reconexión
+
+La reconexión con *backoff* exponencial y *jitter*, el vigilante de inactividad, el presupuesto de reintentos y el apagado ordenado **ya existen** en
+`GeyserMonitor` (Fase 5) y no se duplican: `YellowstoneTransport` es el transporte por el que reconecta. Una credencial rechazada (`UNAUTHENTICATED`,
+`PERMISSION_DENIED`) o una suscripción rechazada (`INVALID_ARGUMENT`, `UNIMPLEMENTED`) **no** se reintenta; `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, mensajes malformados y silencio sí.
+Los tests lo verifican con el supervisor real y reloj pausado (cada intervalo de espera dentro de su rango con *jitter*: 40-50, 80-100, 160-200, 320-400 ms).
+
+### Feed de tips (hallazgo #38)
+
+`tip_feed.rs` (puro): `TipSource`, `floor_from_sol` (SOL → lamports con redondeo, rechazo de NaN/negativos/>1 SOL/percentiles desordenados), `run_tip_feed`
+(primer *fetch* inmediato, intervalo 10 s —mínimo 1 s por el límite del motor público—, plazo de 3 s, *backoff* exponencial hasta 60 s, apagado limpio) que llama a `TipBook::update`.
+`tip_http.rs`: `parse_tip_floor` (array de Jito o envoltorio JSON-RPC; importes en SOL) y `HttpTipSource` (`reqwest`, https salvo loopback, sin redirecciones, respuesta ≤ 16 KiB, errores sin texto remoto).
+Si el feed falla, el suelo envejece y la política vuelve a `JITO_TIP_LAMPORTS`. Uso: `run_tip_feed(HttpTipSource::mainnet()?, Arc::clone(executor.tips()), TipFeedSettings::default(), shutdown)`.
+La URL por defecto (`https://bundles.jito.wtf/api/v1/bundles/tip_floor`) y la forma del documento salen de la especificación pública de la API de Jito; **no se probó contra el servicio real**.
+
+### Verificación de esta entrega (honesta)
+
+`cargo` real **no** se ejecutó. En el *workspace* de prueba (tokio, bytes, thiserror y tracing reales; *mocks* de Solana, `zeroize`, `reqwest` y `serde_json`; *stubs* de `config`/`security`/`network`)
+compilan `yellowstone.rs`, `tip_feed.rs` y `errors.rs`, y pasan los **51 tests de `phase8_tests.rs`** más los 6 unitarios, 108 de `phase5`, 48 de `phase6` y 63 de `phase7`; `clippy --all-targets -- -D warnings` limpio.
+Incluye el `GeyserMonitor` y el `LiveExecutor::run_exit` reales corriendo sobre `YellowstoneTransport` con conexiones simuladas (rechazo, caída, silencio, basura, credenciales rechazadas).
+**Sin compilar ni ejecutar** (dependen de `reqwest`/`serde_json` reales): `src/execution/tip_http.rs` y `tests/phase8_http_tests.rs` (15 tests, contra el servidor HTTP local de `tests/common`).
+Tampoco hay prueba alguna contra un endpoint Yellowstone real: la conversión se probó con mensajes construidos a mano según el esquema protobuf publicado, y el enlace `tonic` aún no existe.
+
+Recuento esperado tras `cargo test --locked` sobre esta rama: 453 (`main`, Linux) + 51 + 15 = **519**.
+
+Pendiente de la Fase 8: (1) los tres gates con `cargo` real; (2) enlace `tonic` (añadir `tonic`/`yellowstone-grpc-proto` y regenerar `Cargo.lock` donde crates.io sea alcanzable); (3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada);
+(4) un `main` que lea `YELLOWSTONE_ENDPOINT`/`YELLOWSTONE_X_TOKEN`, lance `run_tip_feed` y `run_exit` (la configuración por entorno no se añadió: `ENV_KEYS` queda en 21 y `Config` intacta).
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 

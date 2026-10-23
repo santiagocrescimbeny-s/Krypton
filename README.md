@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) completada y verificada en `main`. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) completada y verificada en `main`; Fase 7 (trading en vivo con barrera dry→live, guardas de capital y tip dinámico) completada y verificada en `main`; Fase 8 (adaptador Yellowstone gRPC y feed de tips de Jito) en curso en `phase8-yellowstone-adapter` (falta el enlace `tonic`). Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
@@ -21,12 +21,13 @@ src/
   builder/                 Fase 3: constants, pda, math, instructions, transaction (Create + Buy atómico)
     alt.rs                 Fase 4: Address Lookup Table (crear/extender/decodificar, LaunchLookupTable)
   network/jito.rs          Fase 4: cliente JSON-RPC del Block Engine, tip, ensamblado del bundle
+  network/yellowstone.rs   Fase 8: adaptador Yellowstone (StreamTransport, conversión de mensajes, ping/pong, clasificación gRPC); falta el enlace tonic
   monitor/                 Fase 5: geyser (supervisor del stream), curve, exit (motor de salida por tramos), submit (Jito)
   builder/sell.rs          Fase 5: SellBuilder (sell_v3 firmado)
   docs/yellowstone-adapter.md  Contrato del adaptador gRPC de Yellowstone
   metrics.rs               Fase 6: histogramas de latencia en µs (ingesta del stream → ensamblado de la transacción)
   simulation/              Fase 6: market (curva determinista) y harness (ciclo de vida completo en dry-run, sin red)
-  execution/               Fase 7: settings (flags en vivo), gate (barrera dry→live), guards (SpendingGuards), tip (tip dinámico), live (LiveExecutor)
+  execution/               Fase 7: settings (flags en vivo), gate (barrera dry→live), guards (SpendingGuards), tip (tip dinámico), live (LiveExecutor); Fase 8: tip_feed + tip_http (feed del suelo de tips de Jito)
   logging.rs               Fase 5: suscriptor `tracing` con `EnvFilter` (`info` por defecto, sin datos sensibles)
   monitor/                 andamiaje para la fase 5
 tests/phase1_tests.rs      pruebas de wallet, zeroize y configuración
@@ -34,6 +35,8 @@ tests/phase2_tests.rs      pruebas del motor de metadatos (servidor HTTP simulad
 tests/phase3_tests.rs      pruebas de PDAs, curva, instrucciones, transacción y guardas de gasto
 tests/phase4_tests.rs      pruebas de ALT, tip de Jito, tamaño de la tx y cliente (servidor HTTP simulado)
 tests/phase6_tests.rs      pruebas del harness de simulación, el mercado simulado y las métricas de latencia (sin red)
+tests/phase8_tests.rs      pruebas del adaptador Yellowstone (conexiones simuladas, reconexión, run_exit) y del lazo del feed de tips (sin red)
+tests/phase8_http_tests.rs pruebas del parser y la fuente HTTP del feed de tips (servidor HTTP local)
 tests/phase7_tests.rs      pruebas de la barrera dry→live, las guardas de capital, el tip dinámico y el LiveExecutor (Block Engine simulado, sin red)
 tests/env_hygiene_tests.rs higiene del entorno (.env explícito, PRIVATE_KEY limpiada)
 tests/common/mod.rs        servidor HTTP de pruebas (solo std)

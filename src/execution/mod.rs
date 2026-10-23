@@ -5,6 +5,8 @@
 //! - [`guards`]: [`guards::SpendingGuards`], per-transaction cap, daily drawdown
 //!   tripwire and the 10 % slippage ceiling;
 //! - [`tip`]: dynamic Jito tip calculation ([`tip::TipPolicy`], [`tip::TipBook`]);
+//! - [`tip_feed`] / `tip_http` (Phase 8): the Jito tip-floor feed that keeps the
+//!   [`tip::TipBook`] fresh (pure polling loop, and the HTTP source and parser);
 //! - [`live`]: [`live::LiveExecutor`], which sends launches and runs live exits
 //!   through the Jito Block Engine behind all of the above.
 //!
@@ -18,3 +20,5 @@ pub mod guards;
 pub mod live;
 pub mod settings;
 pub mod tip;
+pub mod tip_feed;
+pub mod tip_http;

@@ -71,6 +71,14 @@ pub enum LauncherError {
     #[error("live trading error: {0}")]
     Live(#[from] LiveError),
 
+    /// Yellowstone adapter configuration failure.
+    #[error("yellowstone error: {0}")]
+    Yellowstone(#[from] YellowstoneError),
+
+    /// Jito tip-floor feed failure.
+    #[error("tip feed error: {0}")]
+    TipFeed(#[from] TipFeedError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -1057,6 +1065,87 @@ impl ExitError {
             Self::Builder(_) => "builder_error",
             Self::Jito(_) => "jito_error",
             Self::GuardRejected(_) => "guard_rejected",
+        }
+    }
+}
+
+/// Invalid Yellowstone adapter configuration (Phase 8).
+///
+/// Static text only: the endpoint (which may embed an access token in its path)
+/// is never echoed.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum YellowstoneError {
+    /// The endpoint URL is unusable.
+    #[error("invalid yellowstone endpoint: {reason}")]
+    InvalidEndpoint {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The `x-token` is unusable.
+    #[error("invalid yellowstone token: {reason}")]
+    InvalidToken {
+        /// Static explanation.
+        reason: &'static str,
+    },
+}
+
+/// Failures of the Jito tip-floor feed (Phase 8).
+///
+/// Variants carry only static labels and numbers: remote text (which could echo
+/// URLs or tokens) is never copied into an error.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TipFeedError {
+    /// The feed settings are inconsistent.
+    #[error("invalid tip feed configuration: {reason}")]
+    InvalidConfig {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The feed could not be reached.
+    #[error("the tip feed is unreachable")]
+    Unreachable,
+
+    /// The feed did not answer within the deadline.
+    #[error("the tip feed timed out")]
+    Timeout,
+
+    /// The feed answered with a non-success HTTP status.
+    #[error("the tip feed answered with HTTP status {status}")]
+    HttpStatus {
+        /// The status code.
+        status: u16,
+    },
+
+    /// The response body exceeds the size cap.
+    #[error("the tip feed response is too large")]
+    ResponseTooLarge,
+
+    /// The response is not a valid tip-floor document.
+    #[error("malformed tip feed response: {reason}")]
+    Malformed {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The shared tip book was poisoned by a panicking task.
+    #[error("the tip book is unavailable")]
+    BookUnavailable,
+}
+
+impl TipFeedError {
+    /// A short, stable, value-free name for the error, safe for logs.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig { .. } => "invalid_config",
+            Self::Unreachable => "unreachable",
+            Self::Timeout => "timeout",
+            Self::HttpStatus { .. } => "http_status",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Malformed { .. } => "malformed",
+            Self::BookUnavailable => "book_unavailable",
         }
     }
 }
