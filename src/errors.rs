@@ -63,6 +63,10 @@ pub enum LauncherError {
     #[error("logging error: {0}")]
     Logging(#[from] LoggingError),
 
+    /// Dry-run simulation harness failure.
+    #[error("simulation error: {0}")]
+    Simulation(#[from] SimulationError),
+
     /// Solana RPC or Jito Block Engine returned an error.
     #[error("RPC error during {context}: {message}")]
     Rpc {
@@ -831,6 +835,55 @@ pub enum ExitError {
     /// Bundle submission failed.
     #[error("Jito error: {0}")]
     Jito(#[from] JitoError),
+}
+
+/// Failures of the dry-run simulation harness (Phase 6).
+///
+/// Variants carry static labels and numbers only, never keys or amounts.
+#[derive(Debug, Error)]
+pub enum SimulationError {
+    /// The harness only runs with `DRY_RUN=true`: it refuses a live configuration
+    /// rather than risk being mistaken for the real pipeline.
+    #[error("the simulation harness refuses to run unless DRY_RUN=true")]
+    LiveModeRefused,
+
+    /// The scenario is inconsistent.
+    #[error("invalid simulation scenario: {reason}")]
+    InvalidScenario {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// A shared simulation structure was poisoned by a panicking task.
+    #[error("the simulated market state is unavailable")]
+    StatePoisoned,
+
+    /// A simulation task ended abnormally.
+    #[error("the `{task}` simulation task failed")]
+    TaskFailed {
+        /// Which task.
+        task: &'static str,
+    },
+
+    /// Curve arithmetic, launch assembly or sell assembly failed.
+    #[error("builder error: {0}")]
+    Builder(#[from] BuilderError),
+
+    /// The exit engine or manager failed.
+    #[error("exit error: {0}")]
+    Exit(#[from] ExitError),
+
+    /// The stream monitor failed.
+    #[error("monitor error: {0}")]
+    Monitor(#[from] MonitorError),
+
+    /// The simulated tip could not be built.
+    #[error("tip error: {0}")]
+    Jito(#[from] JitoError),
+
+    /// The simulation wallet could not be created.
+    #[error("wallet error: {0}")]
+    Wallet(#[from] WalletError),
 }
 
 /// Failures while installing the `tracing` subscriber.

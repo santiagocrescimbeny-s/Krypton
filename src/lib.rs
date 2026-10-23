@@ -13,6 +13,10 @@
 //! the Geyser stream supervisor ([`monitor::geyser`]), bonding-curve decoding
 //! ([`monitor::curve`]), the multi-tranche exit engine ([`monitor::exit`]) and the
 //! Jito-backed sell submitter ([`monitor::submit`]).
+//!
+//! Phase 6 adds [`simulation`] (a network-free dry-run of the whole token
+//! lifecycle with deterministic stress injection) and [`metrics`] (zero-allocation
+//! microsecond latency tracking from stream ingestion to transaction assembly).
 
 #![forbid(unsafe_code)]
 // Zero Panics Policy: enforced by the compiler for all non-test code.
@@ -32,10 +36,12 @@ pub mod builder;
 pub mod config;
 pub mod errors;
 pub mod logging;
+pub mod metrics;
 pub mod monitor;
 pub mod network;
 pub mod parsing;
 pub mod security;
+pub mod simulation;
 pub mod storage;
 
 pub use errors::{LauncherError, Result};

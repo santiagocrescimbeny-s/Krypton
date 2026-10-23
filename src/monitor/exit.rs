@@ -54,6 +54,8 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep_until, timeout, Instant};
 use tracing::{debug, info, warn};
 
+use crate::metrics::PipelineMetrics;
+
 use super::curve::{CurveObservation, PriceReference};
 use super::geyser::StreamUpdate;
 use super::ShutdownSignal;
@@ -920,6 +922,9 @@ pub struct ExitManager {
     curve: Pubkey,
     genesis: Instant,
     settle_timeout: Duration,
+    metrics: Option<Arc<PipelineMetrics>>,
+    /// When the update that has not been acted on yet was received.
+    pending_ingest: Option<std::time::Instant>,
 }
 
 impl ExitManager {
@@ -933,7 +938,19 @@ impl ExitManager {
             curve,
             genesis,
             settle_timeout: DEFAULT_SETTLE_TIMEOUT,
+            metrics: None,
+            pending_ingest: None,
         }
+    }
+
+    /// Records pipeline latencies into `metrics` (see [`crate::metrics`]): the
+    /// instant each curve update is received, and the instant each order is
+    /// issued. The submitter completes the picture with
+    /// [`PipelineMetrics::mark_assembled`].
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<PipelineMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Overrides how long to wait for reports after the window closes.
@@ -1056,10 +1073,16 @@ impl ExitManager {
         if account.pubkey != self.curve {
             return;
         }
+        // Taken before decoding, so decode and decision time are measured too.
+        let received = std::time::Instant::now();
         match CurveObservation::from_account(account) {
             Ok(observation) => {
                 if self.engine.observe(observation) {
                     *observations = observations.saturating_add(1);
+                    self.pending_ingest = Some(received);
+                    if let Some(metrics) = &self.metrics {
+                        metrics.count_observation();
+                    }
                 }
             }
             Err(error) => {
@@ -1076,6 +1099,9 @@ impl ExitManager {
         orders: &mpsc::Sender<SellOrder>,
     ) -> Result<(), ExitError> {
         let result = self.engine.poll(elapsed_ms);
+        // Orders issued right after an update are its reaction; the others were
+        // fired by the schedule's timer (or by a report).
+        let ingest = self.pending_ingest.take();
         for dropped in &result.dropped {
             warn!(
                 trigger = ?dropped.trigger,
@@ -1086,6 +1112,9 @@ impl ExitManager {
         let mut closed = false;
         for order in result.orders {
             debug!(sequence = order.sequence, "dispatching sell order");
+            if let Some(metrics) = &self.metrics {
+                metrics.mark_order(order.sequence, ingest);
+            }
             match orders.try_send(order) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(order)) => {

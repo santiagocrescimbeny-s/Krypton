@@ -1,6 +1,6 @@
 # Krypton — Solana Atomic Launcher & Liquidity Engine
 
-Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) en curso en `phase5-monitor-exit`. Ver [`PROGRESS.md`](PROGRESS.md).
+Estado: **Fases 1-4 completadas** (base, metadatos IPFS/Pinata, constructor atómico Create + Buy), consolidadas en `main`; Fase 4 (Jito Block Engine + ALT) completada y verificada; Fase 5 (monitor de flujo + gestor de salida) completada y verificada en `main`; Fase 6 (harness de simulación, dry-run y métricas de latencia) en curso en `phase6-harness-simulation`. Ver [`PROGRESS.md`](PROGRESS.md).
 
 ## Estructura
 
@@ -24,12 +24,15 @@ src/
   monitor/                 Fase 5: geyser (supervisor del stream), curve, exit (motor de salida por tramos), submit (Jito)
   builder/sell.rs          Fase 5: SellBuilder (sell_v3 firmado)
   docs/yellowstone-adapter.md  Contrato del adaptador gRPC de Yellowstone
+  metrics.rs               Fase 6: histogramas de latencia en µs (ingesta del stream → ensamblado de la transacción)
+  simulation/              Fase 6: market (curva determinista) y harness (ciclo de vida completo en dry-run, sin red)
   logging.rs               Fase 5: suscriptor `tracing` con `EnvFilter` (`info` por defecto, sin datos sensibles)
   monitor/                 andamiaje para la fase 5
 tests/phase1_tests.rs      pruebas de wallet, zeroize y configuración
 tests/phase2_tests.rs      pruebas del motor de metadatos (servidor HTTP simulado)
 tests/phase3_tests.rs      pruebas de PDAs, curva, instrucciones, transacción y guardas de gasto
 tests/phase4_tests.rs      pruebas de ALT, tip de Jito, tamaño de la tx y cliente (servidor HTTP simulado)
+tests/phase6_tests.rs      pruebas del harness de simulación, el mercado simulado y las métricas de latencia (sin red)
 tests/env_hygiene_tests.rs higiene del entorno (.env explícito, PRIVATE_KEY limpiada)
 tests/common/mod.rs        servidor HTTP de pruebas (solo std)
 ```

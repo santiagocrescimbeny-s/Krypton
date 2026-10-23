@@ -39,6 +39,7 @@ use tracing::{debug, warn};
 use super::exit::{SellOrder, SellOutcome, SellSubmitter};
 use crate::builder::sell::SellBuilder;
 use crate::errors::{ExitError, JitoError};
+use crate::metrics::PipelineMetrics;
 use crate::network::{InflightStatus, JitoClient, JitoTip};
 use crate::security::SecureWallet;
 
@@ -81,6 +82,7 @@ pub struct JitoSellSubmitter {
     tip: JitoTip,
     poll_interval: Duration,
     max_polls: u32,
+    metrics: Option<Arc<PipelineMetrics>>,
 }
 
 impl std::fmt::Debug for JitoSellSubmitter {
@@ -113,7 +115,16 @@ impl JitoSellSubmitter {
             tip,
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_polls: DEFAULT_MAX_POLLS,
+            metrics: None,
         }
+    }
+
+    /// Reports the instant each transaction is assembled and signed to
+    /// `metrics` (see [`crate::metrics`]).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<PipelineMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Overrides the status polling cadence.
@@ -149,6 +160,9 @@ impl SellSubmitter for JitoSellSubmitter {
             std::slice::from_ref(&tip_instruction),
             &self.wallet,
         )?;
+        if let Some(metrics) = &self.metrics {
+            metrics.mark_assembled(order.sequence);
+        }
 
         let bundle_id = match self
             .client

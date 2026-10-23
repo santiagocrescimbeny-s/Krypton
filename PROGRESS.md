@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-23 · Base: `main` (`26d4ecf`) = Fases 1-4 + correcciones de las auditorías; rama `phase5-monitor-exit` (`6d5f99c` + correcciones de la auditoría 2026-10-22, #28-#34), fusionable por *fast-forward*
+Última actualización: 2026-10-23 · Base: `main` (`94eae34`) = Fases 1-5 + correcciones de las auditorías (CI verde según el propietario: 342 tests, clippy y `cargo audit`); rama `phase6-harness-simulation` (desde `94eae34`): Fase 6 en curso
 
 ## Hoja de ruta
 
@@ -10,8 +10,8 @@
 | 2 | Motor asíncrono de metadatos (IPFS / Pinata) | ✅ **VERIFICADA** (auditoría 2026-10-20) |
 | 3 | Constructor atómico de transacciones (Create + Buy) | ✅ **COMPLETED & VERIFIED** (auditoría 2026-10-20 run 2; guardas #19/#20/#22 confirmadas por el propietario con 164 tests en `main`) |
 | 4 | Enrutamiento Jito Block Engine + ALT (+ simulación previa) | ✅ **COMPLETED & VERIFIED** (213 tests en `main` según el propietario; fusionada en `26d4ecf`) |
-| 5 | Monitor Yellowstone gRPC + gestor de salida | 🟡 **CÓDIGO COMPLETO · VERIFICACIÓN PENDIENTE** — `phase5-monitor-exit`: hallazgos #29/#30/#31/#33/#34 corregidos; falta correr `cargo check/clippy/test --locked` con las crates reales (y regenerar `Cargo.lock`, #28). Pasa a `COMPLETED & VERIFIED` solo con esos tres gates en verde |
-| 6 | Harness de pruebas, `tracing` y dry-run | ⬜ Pendiente |
+| 5 | Monitor Yellowstone gRPC + gestor de salida | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`94eae34`); hallazgos #28-#34 de la auditoría 2026-10-22 resueltos salvo #32 (adaptador `tonic`, aplazado); CI verde según el propietario: 342 tests, `cargo clippy -D warnings` y `cargo audit` |
+| 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | 🟡 **IN PROGRESS** — `phase6-harness-simulation`: código y tests escritos; verificación con `cargo` real pendiente (ver «Fase 6») |
 
 ## Fase 1 — completada y verificada
 
@@ -143,9 +143,9 @@ Verificación de esta entrega: `rustfmt --check` limpio; `alt.rs` y el builder c
 reales (crates.io bloqueado en el sandbox), por lo que el cliente HTTP (`reqwest`/`serde`) y `tests/phase4_tests.rs` están sin compilar.
 Recuento esperado: 6 unitarios + 6 `env_hygiene` + 38 `phase1` + 38 `phase2` + 77 `phase3` + 48 `phase4` = **213**.
 
-## Fase 5 — Monitor de flujo y gestor de salida (CÓDIGO COMPLETO · VERIFICACIÓN PENDIENTE)
+## Fase 5 — Monitor de flujo y gestor de salida (COMPLETED & VERIFIED)
 
-Rama `phase5-monitor-exit`. Código nuevo: `src/monitor/{curve,geyser,exit,submit}.rs`, `src/builder/sell.rs`,
+Fusionada en `main` (`94eae34`); el propietario confirmó CI en verde (342 tests, clippy, `cargo audit`). Las notas de verificación de abajo describen el sandbox en el que se escribió, no el estado actual. Código nuevo: `src/monitor/{curve,geyser,exit,submit}.rs`, `src/builder/sell.rs`,
 `SellPlan` en `builder/math.rs`, `sell_v3` en `builder/instructions.rs`, variantes `MonitorError` / `ExitError` /
 `StreamErrorKind` / `BuilderError::ZeroSellAmount` en `src/errors.rs`, `tests/phase5_tests.rs` (108 tests),
 `tests/phase5_submit_tests.rs` (15 tests), `tests/logging_tests.rs` (6 tests), `src/logging.rs` y `docs/yellowstone-adapter.md`.
@@ -196,6 +196,51 @@ Recuento esperado tras `cargo test --locked`: 213 (Fases 1-4) + 108 `phase5` + 1
 
 Pendiente de la Fase 5: adaptador Yellowstone real (`tonic`), cableado en un `main` con `trigger_on_ctrl_c`, lectura viva del
 saldo de tokens, y las comprobaciones con `cargo` real descritas arriba.
+
+## Fase 6 — Harness de simulación, dry-run y observabilidad (IN PROGRESS)
+
+Rama `phase6-harness-simulation` (desde `main` `94eae34`). Código nuevo: `src/metrics.rs`, `src/simulation/{mod,market,harness}.rs`,
+`SimulationError` (y `LauncherError::Simulation`) en `src/errors.rs`, `tests/phase6_tests.rs` (47 tests). Cambios en código existente:
+`ExitManager::with_metrics` (`monitor/exit.rs`) y `JitoSellSubmitter::with_metrics` (`monitor/submit.rs`), ambos opcionales y sin efecto si no se usan.
+
+| Pieza | Contenido |
+|-------|-----------|
+| `simulation/market.rs` | Mercado de *bonding curve* determinista: `SplitMix64` con semilla, flujo de operaciones externas (`generate_flow`), impacto de precio con la matemática de producción (`BuyPlan`/`SellPlan`), reloj de slots monótono y `account_update`, que codifica la cuenta `BondingCurve` de 166 bytes que decodifica el `BondingCurveState` real |
+| `simulation/harness.rs` | `SimulationHarness::run`: Genesis (`LaunchBuilder` real: financiación, compilación y firma) → compra atómica → evolución de la curva → salida por tramos (`ExitManager` + `run_sell_executor` reales) sobre el `GeyserMonitor` real. Solo dos fronteras son simuladas: `SimulatedTransport` (stream Geyser) y `SimulatedSubmitter` (Block Engine en memoria). `ScenarioConfig::{calm, volatile, hostile}`, `StressProfile`, `SimulationReport` con `accounting_consistent()` y `fingerprint()` |
+| `metrics.rs` | `LatencyHistogram` (40 cubos de potencias de 2, atómico, sin asignaciones, suma saturante), `Stopwatch`, `PipelineMetrics`: instante de recepción de la actualización → orden emitida → transacción ensamblada, en µs con `std::time::Instant`; percentiles p50/p95/p99 |
+
+Frontera de seguridad (nada sale del proceso, ningún tip se paga):
+
+- **Estructural:** `src/simulation` no importa cliente HTTP, cliente del Block Engine ni sockets. Un test (`source_scan_*`) rastrea el código de
+  `harness.rs` y `market.rs` buscando `reqwest`, `JitoClient`, `send_bundle`, `TcpStream`, `std::net`, `tonic`, `unsafe`, `unwrap`/`expect`/`panic!`…
+- **Configuración:** `SimulationHarness::from_config` rechaza `DRY_RUN=false` con `SimulationError::LiveModeRefused`.
+- **Claves:** billetera y *mint* se derivan de la semilla del escenario (públicas por construcción, sin fondos). Las transacciones se
+  ensamblan y firman de verdad (para medir la latencia real) y se descartan en memoria. Los tips son **virtuales**: se cuentan en
+  `BoundaryReport` y nunca salen del proceso.
+
+Estrés inyectado (todo desde una semilla, reproducible): flujo de fondo y *shocks* explícitos (p. ej. una ballena vendiendo el 90 %),
+*jitter* de entrega del stream, caída del stream con snapshot al reconectar, latencia de envío, bundles descartados, resultados `Unknown`
+(que a veces sí aterrizaron) y *slippage* real: la orden se cotizó antes y se ejecuta contra la curva actual, y falla si el neto queda por
+debajo de `min_sol_output`. Todo con `tokio::time`: con el reloj pausado una ventana de 10 s tarda microsegundos.
+
+Observabilidad: los logs de la simulación llevan solo contadores, secuencias y etiquetas (`simulation finished`, `pipeline latency summary`);
+filtro `info` por defecto (`src/logging.rs`). Un test captura **todos** los niveles de una corrida hostil y comprueba que no hay texto con
+forma de clave/firma, ni los campos `lamports`/`balance`/`signature`/`secret`, ni ninguna de las cifras de la corrida (posición, proceeds,
+reservas). La latencia «ingesta → ensamblado» se mide solo para órdenes disparadas **por una actualización** (stop-loss o tramo que esperaba
+su primera observación); las del temporizador se miden de emisión a ensamblado.
+
+Verificación de esta entrega (honesta): crates.io sigue bloqueado en el sandbox, así que **no** se ejecutó `cargo` real ni `--locked`.
+En el *workspace* de prueba (tokio, bytes, thiserror y tracing reales; *mocks* de Solana, `zeroize`, `reqwest`, `serde_json`) compilan
+`metrics.rs`, `simulation/*`, `monitor/{curve,geyser,exit}.rs`, `builder/*`, y pasan **47 tests de `phase6_tests.rs`** y los 108 de
+`phase5_tests.rs`; `clippy --all-targets -- -D warnings` limpio con los lints `deny` del crate. **Sin verificar con las crates reales:**
+firmas reales y tamaño real de `try_compile` (el *mock* los falsea; el test del tamaño del launch usa `MAX_TRANSACTION_SIZE` y debe
+confirmarse), `Config::from_vars` con `DRY_RUN`, `monitor/submit.rs` (solo cambia una línea de métricas) y la compatibilidad de `[const { AtomicU64::new(0) }; N]` con el MSRV (rustc 1.97.1: debería ser válido).
+No se añadieron dependencias ni se tocó `Cargo.lock`.
+
+Recuento esperado tras `cargo test --locked`: 342 (hasta la Fase 5) + 47 `phase6` = **389**.
+
+Pendiente de la Fase 6: correr los tres gates con `cargo` real, regenerar `Cargo.lock` solo si hiciera falta (no debería), y decidir
+si el binario `main` expone un subcomando `simulate` (hoy el harness es una librería) y si se añade salida estructurada/archivo.
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
 
