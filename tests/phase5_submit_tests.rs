@@ -205,7 +205,11 @@ async fn a_landed_bundle_reports_its_slot_and_carries_the_signed_sell_and_tip() 
 
 #[tokio::test]
 async fn each_order_uses_the_freshest_blockhash() -> TestResult {
-    let server = scripted(vec![status_reply("Landed", json!(1u64))])?;
+    // Two submissions, so answer by method rather than by request index.
+    let server = MockServer::start(|_, request| match method_of(request).as_deref() {
+        Ok("sendBundle") => rpc_ok(&json!(BUNDLE_ID)),
+        _ => status_reply("Landed", json!(1u64)),
+    })?;
     let fixture = fixture(&server, false, 3)?;
     let order = order()?;
 
@@ -267,11 +271,11 @@ async fn failed_and_invalid_bundles_are_reported_as_failed() -> TestResult {
 #[tokio::test]
 async fn an_unresolved_bundle_is_unknown_not_failed_after_the_polling_budget() -> TestResult {
     let server = scripted(vec![status_reply("Pending", Value::Null)])?;
-    let fixture = fixture(&server, false, 4)?;
+    let pending = fixture(&server, false, 4)?;
     // The bundle may still land: reporting Failed would let the engine sell the
     // same tokens again and burn a second tip.
     assert_eq!(
-        fixture.submitter.submit(&order()?).await?,
+        pending.submitter.submit(&order()?).await?,
         SellOutcome::Unknown
     );
     assert_eq!(server.request_count(), 1 + 4);
@@ -280,9 +284,9 @@ async fn an_unresolved_bundle_is_unknown_not_failed_after_the_polling_budget() -
     let server = scripted(vec![rpc_ok(
         &json!({ "context": { "slot": 1u64 }, "value": null }),
     )])?;
-    let fixture = fixture(&server, false, 2)?;
+    let unheard_of = fixture(&server, false, 2)?;
     assert_eq!(
-        fixture.submitter.submit(&order()?).await?,
+        unheard_of.submitter.submit(&order()?).await?,
         SellOutcome::Unknown
     );
     assert_eq!(server.request_count(), 1 + 2);
