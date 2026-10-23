@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-24 · Rama `phase8-yellowstone-adapter` (desde `main` `9c00e18`): Fase 8 en curso · Base: `main` = Fases 1-7 (Fase 7 fusionada desde `phase7-live-trading`, `850463a`; 452 tests en Windows, 453 en Linux)
+Última actualización: 2026-10-24 · `main` = Fases 1-7 + núcleo de la Fase 8 (fusionado desde `phase8-yellowstone-adapter`, `6523991`; 518 tests en Windows, 519 esperados en Linux) · Fase 8 en curso: falta el enlace `tonic`
 
 ## Hoja de ruta
 
@@ -13,7 +13,7 @@
 | 5 | Monitor Yellowstone gRPC + gestor de salida | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`94eae34`); hallazgos #28-#34 de la auditoría 2026-10-22 resueltos salvo #32 (adaptador `tonic`, aplazado); CI verde según el propietario: 342 tests, `cargo clippy -D warnings` y `cargo audit` |
 | 6 | Harness de simulación, dry-run y observabilidad (`tracing`, métricas) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` (`0291190`); CI verde según el propietario: 390 tests |
 | 7 | Trading en vivo e integración con mainnet (barrera dry→live, guardas de capital, tip dinámico) | ✅ **COMPLETED & VERIFIED** — fusionada en `main` desde `phase7-live-trading` (`850463a`); `cargo check`/`clippy -D warnings`/`test --locked` con las crates reales: 452 tests en Windows (el test de permisos `#[cfg(unix)]` se verifica en el CI de Linux) |
-| 8 | Adaptador Yellowstone gRPC y feed de tips de Jito | 🟡 **IN PROGRESS** — `phase8-yellowstone-adapter`: núcleo del adaptador, feed de tips y tests escritos; **falta el enlace `tonic`** (bloqueado: requiere cambiar `Cargo.lock`) y la verificación con `cargo` real (ver «Fase 8») |
+| 8 | Adaptador Yellowstone gRPC y feed de tips de Jito | 🟡 **IN PROGRESS** — núcleo del adaptador y feed de tips fusionados en `main` desde `phase8-yellowstone-adapter` (`6523991`) y verificados con `cargo` real (`check`/`clippy -D warnings`/`test --locked`: 518 tests en Windows); **falta el enlace `tonic`** (requiere cambiar `Cargo.lock`), la prueba de humo contra un endpoint real y el `main` (ver «Fase 8») |
 
 ## Fase 1 — completada y verificada
 
@@ -325,7 +325,11 @@ Tampoco hay prueba alguna contra un endpoint Yellowstone real: la conversión se
 
 Recuento esperado tras `cargo test --locked` sobre esta rama: 453 (`main`, Linux) + 51 + 15 = **519**.
 
-Pendiente de la Fase 8: (1) los tres gates con `cargo` real; (2) enlace `tonic` (añadir `tonic`/`yellowstone-grpc-proto` y regenerar `Cargo.lock` donde crates.io sea alcanzable); (3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada);
+**Verificación con `cargo` real (2026-10-24, Windows, sobre `6523991`):** `cargo check --all-targets --locked`, `cargo clippy --all-targets --locked -- -D warnings`
+y `cargo test --locked` en verde: **518 tests**, 0 fallos (452 previos + 51 `phase8` + 15 `phase8_http`; el test `#[cfg(unix)]` de la Fase 7 se verifica en el CI de Linux).
+`tip_http.rs` y `phase8_http_tests.rs` quedan así compilados y probados con `reqwest`/`serde_json` reales. Fusionada en `main` por *fast-forward*.
+
+Pendiente de la Fase 8: (1) ~~los tres gates con `cargo` real~~ hecho; (2) enlace `tonic` (añadir `tonic`/`yellowstone-grpc-proto` y regenerar `Cargo.lock` donde crates.io sea alcanzable); (3) prueba de humo contra un endpoint real (cuenta de la curva, *ping*, caída forzada);
 (4) un `main` que lea `YELLOWSTONE_ENDPOINT`/`YELLOWSTONE_X_TOKEN`, lance `run_tip_feed` y `run_exit` (la configuración por entorno no se añadió: `ENV_KEYS` queda en 21 y `Config` intacta).
 
 ## Correcciones de la auditoría 2026-10-20 (fusionadas en `main`)
