@@ -13,6 +13,14 @@
 //! 6. the keypair in that file is **the configured wallet**, so a stale or
 //!    wrong key file can never sign.
 //!
+//! [`open_guards`] adds the last check (audit finding #35), run by
+//! [`LiveExecutor::arm`](super::live::LiveExecutor::arm) right after the
+//! barrier and before any connection exists:
+//!
+//! 7. `GUARD_STATE_PATH` points to a **valid persisted spending state**
+//!    (present, `0600`, intact, not dated in the future, lockable, writable).
+//!    Missing, unreadable or corrupted state is a refusal, never a fresh day.
+//!
 //! Nothing here panics: a failed check is an error value, and the process
 //! simply does not get a [`LiveExecutor`](super::live::LiveExecutor).
 
@@ -20,7 +28,8 @@ use std::path::Path;
 
 use zeroize::Zeroizing;
 
-use super::guards::GuardLimits;
+use super::guards::{GuardLimits, SpendingGuards};
+use super::persist::{read_state, write_state, StateLock, StateWriter};
 use super::settings::LiveSettings;
 use super::tip::TipPolicy;
 use crate::errors::LiveError;
@@ -64,6 +73,35 @@ pub fn load_keypair_file(path: &Path) -> Result<SecureWallet, LiveError> {
     let bytes = Zeroizing::new(std::fs::read(path).map_err(|_| reject("cannot be read"))?);
     let text = std::str::from_utf8(&bytes).map_err(|_| reject("is not valid UTF-8"))?;
     SecureWallet::from_secret_str(text.trim()).map_err(|_| reject("is not a valid keypair"))
+}
+
+/// Opens the persisted spending state and builds the guards that continue from it.
+///
+/// Order: take the file lock, read and validate the record, rebuild the books
+/// ([`SpendingGuards::restore`]), prove the file is writable by rewriting the
+/// restored books **synchronously**, then hand every later change to the
+/// background writer. Nothing here touches the network.
+///
+/// # Errors
+/// - [`LiveError::GuardStatePathMissing`] when `GUARD_STATE_PATH` is not set;
+/// - [`LiveError::GuardState`] when the file is locked, missing, unreadable,
+///   insecure, corrupted or unwritable;
+/// - [`LiveError::Guard`] when the record is dated in the future.
+pub fn open_guards(
+    settings: &LiveSettings,
+    limits: GuardLimits,
+    now_secs: u64,
+) -> Result<SpendingGuards, LiveError> {
+    let path = settings
+        .guard_state_path
+        .as_deref()
+        .ok_or(LiveError::GuardStatePathMissing)?;
+    let lock = StateLock::acquire(path)?;
+    let saved = read_state(path)?;
+    let guards = SpendingGuards::restore(limits, &saved, now_secs)?;
+    write_state(path, &guards.persisted()?)?;
+    let writer = StateWriter::spawn(path.to_path_buf(), lock)?;
+    Ok(guards.with_persistence(writer)?)
 }
 
 /// Runs the barrier. See the module documentation for the order of the checks.

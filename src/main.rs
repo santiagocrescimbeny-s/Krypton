@@ -127,6 +127,11 @@ fn run() -> Result<ExitCode, LauncherError> {
             ));
             Ok(ExitCode::SUCCESS)
         }
+        Command::InitState => {
+            runner::init_state(&config)?;
+            say("spending state file created\n");
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Exit(args) => {
             // The keypair file is verified in every mode when one is configured,
             // so a bad permission shows up in a rehearsal, not on the real run.

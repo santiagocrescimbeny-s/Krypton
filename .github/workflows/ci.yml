@@ -46,6 +46,23 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+      # Audit finding #48: the gRPC link (`src/network/grpc.rs`) is compiled only with
+      # `--features grpc`, and only once its dependencies are declared in Cargo.toml
+      # (docs/yellowstone-adapter.md). Until then these steps say so and pass; after
+      # that they are the same three gates with the feature on. A half-done enabling
+      # is caught by tests/manifest_tests.rs.
+      - name: Check, clippy and tests with the gRPC link
+        shell: bash
+        run: |
+          if grep -Eq '^yellowstone-grpc-proto[[:space:]]*=[[:space:]]*\{[[:space:]]*workspace' Cargo.toml \
+             && grep -Eq '^grpc[[:space:]]*=[[:space:]]*\["dep:' Cargo.toml; then
+            cargo check --all-targets --locked --features grpc
+            cargo clippy --all-targets --locked --features grpc -- -D warnings
+            cargo test --locked --features grpc
+          else
+            echo "gRPC dependencies are not declared yet: skipping the --features grpc gates"
+          fi
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest

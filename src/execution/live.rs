@@ -53,14 +53,14 @@ use crate::config::Config;
 use crate::errors::{ExitError, JitoError, LiveError};
 use crate::metrics::PipelineMetrics;
 use crate::monitor::exit::{
-    order_channel, report_channel, run_sell_executor, ExitEngine, ExitManager, ExitSummary,
-    SellOrder, SellOutcome, SellSubmitter,
+    order_channel, report_channel, run_sell_executor, BalanceReader, ExitEngine, ExitManager,
+    ExitSummary, SellOrder, SellOutcome, SellSubmitter,
 };
 use crate::monitor::geyser::{
     GeyserMonitor, HealthStatus, MonitorSettings, StreamCommitment, StreamTransport,
     SubscriptionRequest,
 };
-use crate::monitor::submit::{TimedBlockhash, MAX_BLOCKHASH_AGE};
+use crate::monitor::submit::{is_definite_failure, TimedBlockhash, MAX_BLOCKHASH_AGE};
 use crate::monitor::{shutdown_channel, ShutdownSignal};
 use crate::network::{BundleId, InflightStatus, JitoClient, JitoTip, JITO_TIP_ACCOUNTS};
 use crate::security::SecureWallet;
@@ -137,8 +137,9 @@ async fn poll_bundle<E: BlockEngine>(
         }
         match engine.inflight_status(id).await {
             Ok(InflightStatus::Landed { slot }) => return BundleOutcome::Landed { slot },
-            Ok(InflightStatus::Failed | InflightStatus::Invalid) => return BundleOutcome::Failed,
-            Ok(InflightStatus::Pending | InflightStatus::NotFound) => {}
+            Ok(status) if is_definite_failure(&status, attempt) => return BundleOutcome::Failed,
+            // Pending, not found, or an `Invalid` still within its soft retries.
+            Ok(_) => {}
             Err(error) if error.is_retryable() => {
                 debug!(%error, "bundle status check failed; retrying");
             }
@@ -250,8 +251,14 @@ impl LiveExecutor<JitoClient> {
             config.jito_tip_lamports,
             config.max_jito_tip_lamports,
         )?;
+        // Audit #35: no trusted spending state, no live trading. Before any
+        // client exists, so a refusal costs no connection.
+        let guards = gate::open_guards(&config.live, armed.limits, unix_now()?)?;
         let client = JitoClient::from_config(config)?;
-        Self::with_engine(Arc::new(client), Arc::new(wallet), &armed)
+        Ok(
+            Self::with_engine(Arc::new(client), Arc::new(wallet), &armed)?
+                .with_guards(Arc::new(guards)),
+        )
     }
 }
 
@@ -322,6 +329,13 @@ impl<E: BlockEngine> LiveExecutor<E> {
     #[must_use]
     pub fn guards(&self) -> &Arc<SpendingGuards> {
         &self.guards
+    }
+
+    /// Replaces the guards (for example with ones restored from disk).
+    #[must_use]
+    pub fn with_guards(mut self, guards: Arc<SpendingGuards>) -> Self {
+        self.guards = guards;
+        self
     }
 
     /// The tip book: publish tip floors into it.
@@ -486,6 +500,7 @@ impl<E: BlockEngine> LiveExecutor<E> {
             genesis: exit.genesis,
             monitor: exit.monitor,
             drain_timeout: exit.drain_timeout,
+            balance: exit.balance,
         };
         run_exit_pipeline(
             transport,
@@ -510,6 +525,9 @@ pub struct ExitPipeline {
     pub monitor: MonitorSettings,
     /// How long submissions in progress may run after shutdown.
     pub drain_timeout: Duration,
+    /// Reads the position's token balance to settle unknown orders at the end
+    /// (audit finding #45); `None` leaves them unresolved.
+    pub balance: Option<BalanceReader>,
 }
 
 /// Runs the exit pipeline around any [`SellSubmitter`]: the stream supervisor,
@@ -539,6 +557,9 @@ where
     let mut manager = ExitManager::new(pipeline.engine, pipeline.curve_account, pipeline.genesis);
     if let Some(metrics) = metrics {
         manager = manager.with_metrics(metrics);
+    }
+    if let Some(reader) = pipeline.balance {
+        manager = manager.with_balance_reader(reader);
     }
 
     let (events_tx, events_rx) = mpsc::channel(1_024);
@@ -612,6 +633,9 @@ pub struct ExitRun {
     pub monitor: MonitorSettings,
     /// How long submissions in progress may run after shutdown.
     pub drain_timeout: Duration,
+    /// Reads the position's token balance to settle unknown orders at the end
+    /// (audit finding #45); `None` leaves them unresolved.
+    pub balance: Option<BalanceReader>,
 }
 
 /// What a live exit produced.

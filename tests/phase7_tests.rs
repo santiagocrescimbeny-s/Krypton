@@ -123,6 +123,7 @@ fn raw_live(pairs: &[(&str, &str)]) -> RawLiveSettings {
         live_trading: get("LIVE_TRADING"),
         live_confirm: get("LIVE_CONFIRM"),
         live_keypair_path: get("LIVE_KEYPAIR_PATH"),
+        guard_state_path: get("GUARD_STATE_PATH"),
         max_sol_per_tx: get("MAX_SOL_PER_TX"),
         daily_drawdown_sol: get("DAILY_DRAWDOWN_SOL"),
     }
@@ -134,6 +135,7 @@ fn armed_settings(path: &Path) -> LiveSettings {
         live_trading: true,
         confirmed: true,
         keypair_path: Some(path.to_path_buf()),
+        guard_state_path: None,
         max_spend_per_tx_lamports: Some(2_000_000_000),
         daily_drawdown_lamports: Some(5_000_000_000),
     }
@@ -520,11 +522,15 @@ fn arm_from_a_config_crosses_the_barrier_end_to_end() -> TestResult {
     let dir = scratch("config-arm")?;
     let path = write_keypair_file(&dir, "live.json", 7)?;
     let path_text = path.to_str().ok_or("non UTF-8 temp path")?;
+    let state = dir.join("guards.state");
+    krypton::execution::persist::init_state(&state, 0)?;
+    let state_text = state.to_str().ok_or("non UTF-8 temp path")?;
     let vars = |dry_run: &str| {
         config_vars(&[
             ("LIVE_TRADING", "true"),
             ("LIVE_CONFIRM", LIVE_CONFIRM_PHRASE),
             ("LIVE_KEYPAIR_PATH", path_text),
+            ("GUARD_STATE_PATH", state_text),
             ("MAX_SOL_PER_TX", "1"),
             ("DAILY_DRAWDOWN_SOL", "3"),
             ("DRY_RUN", dry_run),
@@ -1811,6 +1817,7 @@ async fn live_exit_sells_the_whole_position_through_the_guards() -> TestResult {
                 blockhash,
                 monitor: MonitorSettings::default(),
                 drain_timeout: Duration::from_secs(5),
+                balance: None,
             },
             shutdown,
         )
@@ -1834,8 +1841,9 @@ async fn live_exit_sells_the_whole_position_through_the_guards() -> TestResult {
 
 #[test]
 fn source_scan_execution_has_no_panics_or_unsafe_code() {
-    const SOURCES: [(&str, &str); 5] = [
+    const SOURCES: [(&str, &str); 6] = [
         ("settings.rs", include_str!("../src/execution/settings.rs")),
+        ("persist.rs", include_str!("../src/execution/persist.rs")),
         ("gate.rs", include_str!("../src/execution/gate.rs")),
         ("guards.rs", include_str!("../src/execution/guards.rs")),
         ("tip.rs", include_str!("../src/execution/tip.rs")),
@@ -1860,4 +1868,124 @@ fn source_scan_execution_has_no_panics_or_unsafe_code() {
 #[test]
 fn tip_accounts_are_available_for_the_live_executor() {
     assert_eq!(JITO_TIP_ACCOUNTS.len(), 8);
+}
+
+// =====================================================================================================
+// `Invalid` is retried softly (audit finding #37)
+// =====================================================================================================
+
+#[tokio::test(start_paused = true)]
+async fn an_invalid_bundle_is_retried_before_it_is_declared_failed() -> TestResult {
+    let f = fixture()?;
+    let engine = Arc::new(FakeEngine::new(InflightStatus::Invalid));
+    let executor = executor(
+        Arc::clone(&engine),
+        &f.payer,
+        &armed(2_000_000_000, 5_000_000_000)?,
+    )?;
+    let receipt = executor
+        .launch(&request(&f.builder, &f.mint, &f.table, 10_000_000_000))
+        .await?;
+    assert_eq!(receipt.outcome, BundleOutcome::Failed);
+    // Checks 0, 1 and 2 are soft; the fourth one (index 3) is final.
+    assert_eq!(engine.polls(), 4);
+    let books = executor.guards().snapshot()?;
+    assert_eq!((books.committed_lamports, books.reserved_lamports), (0, 0));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_invalid_that_turns_into_a_landing_is_a_landing() -> TestResult {
+    let f = fixture()?;
+    let engine = Arc::new(FakeEngine::new(InflightStatus::Pending));
+    for _ in 0..2 {
+        engine.script_status(Ok(InflightStatus::Invalid))?;
+    }
+    engine.script_status(Ok(InflightStatus::Landed { slot: 4_242 }))?;
+    let executor = executor(
+        Arc::clone(&engine),
+        &f.payer,
+        &armed(2_000_000_000, 5_000_000_000)?,
+    )?;
+    let receipt = executor
+        .launch(&request(&f.builder, &f.mint, &f.table, 10_000_000_000))
+        .await?;
+    assert_eq!(receipt.outcome, BundleOutcome::Landed { slot: 4_242 });
+    assert_eq!(engine.polls(), 3);
+    assert!(executor.guards().snapshot()?.committed_lamports > 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_stays_final_at_the_first_check() -> TestResult {
+    let f = fixture()?;
+    let engine = Arc::new(FakeEngine::new(InflightStatus::Failed));
+    let executor = executor(
+        Arc::clone(&engine),
+        &f.payer,
+        &armed(2_000_000_000, 5_000_000_000)?,
+    )?;
+    let receipt = executor
+        .launch(&request(&f.builder, &f.mint, &f.table, 10_000_000_000))
+        .await?;
+    assert_eq!(receipt.outcome, BundleOutcome::Failed);
+    assert_eq!(engine.polls(), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_polling_budget_inside_the_soft_window_ends_unknown_not_failed() -> TestResult {
+    // Only three checks are allowed and all three say `Invalid`: that is still
+    // inside the soft window, so the money stays committed.
+    let f = fixture()?;
+    let engine = Arc::new(FakeEngine::new(InflightStatus::Invalid));
+    let executor = executor(
+        Arc::clone(&engine),
+        &f.payer,
+        &armed(2_000_000_000, 5_000_000_000)?,
+    )?
+    .with_polling(Duration::from_millis(100), 3);
+    let receipt = executor
+        .launch(&request(&f.builder, &f.mint, &f.table, 10_000_000_000))
+        .await?;
+    assert_eq!(receipt.outcome, BundleOutcome::Unknown);
+    assert_eq!(engine.polls(), 3);
+    assert!(executor.guards().snapshot()?.committed_lamports > 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn invalid_sells_get_the_same_soft_retries() -> TestResult {
+    let f = fixture()?;
+    let (_tx, blockhash) = blockhash_channel(Hash::new_from_array([2; 32]));
+
+    let invalid = Arc::new(FakeEngine::new(InflightStatus::Invalid));
+    let exec = executor(
+        Arc::clone(&invalid),
+        &f.payer,
+        &armed(2_000_000_000, 5_000_000_000)?,
+    )?;
+    let submitter = exec.sell_submitter(sell_builder(&f.payer)?, blockhash.clone());
+    assert_eq!(
+        submitter.submit(&sell_order(0)?).await?,
+        SellOutcome::Failed
+    );
+    assert_eq!(invalid.polls(), 4);
+    let books = exec.guards().snapshot()?;
+    assert_eq!((books.committed_lamports, books.returned_lamports), (0, 0));
+
+    let recovering = Arc::new(FakeEngine::new(InflightStatus::Pending));
+    recovering.script_status(Ok(InflightStatus::Invalid))?;
+    recovering.script_status(Ok(InflightStatus::Landed { slot: 9 }))?;
+    let exec = executor(
+        Arc::clone(&recovering),
+        &f.payer,
+        &armed(2_000_000_000, 5_000_000_000)?,
+    )?;
+    let submitter = exec.sell_submitter(sell_builder(&f.payer)?, blockhash);
+    assert_eq!(
+        submitter.submit(&sell_order(0)?).await?,
+        SellOutcome::Landed { slot: 9 }
+    );
+    Ok(())
 }

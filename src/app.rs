@@ -34,7 +34,7 @@ use solana_pubkey::Pubkey;
 use solana_sdk::hash::Hash;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
 use tracing::{info, warn};
 
 use crate::builder::math::DEFAULT_TOTAL_FEE_BPS;
@@ -46,7 +46,7 @@ use crate::execution::settings::{LiveSettings, LIVE_CONFIRM_PHRASE};
 use crate::execution::tip::TipBook;
 use crate::execution::tip_feed::{run_tip_feed, TipFeedSettings, TipFeedStats, TipSource};
 use crate::monitor::curve::PriceReference;
-use crate::monitor::exit::{ExitEngine, ExitPlan, ExitSettings, Position};
+use crate::monitor::exit::{BalanceOutcome, ExitEngine, ExitPlan, ExitSettings, Position};
 use crate::monitor::submit::{stamp_blockhash, TimedBlockhash};
 use crate::monitor::{shutdown_channel, ShutdownSignal, ShutdownTrigger};
 use crate::security::SecureWallet;
@@ -63,7 +63,8 @@ USAGE:
                  --entry-sol-reserves <LAMPORTS> --entry-token-reserves <BASE_UNITS>
                  [--tranches <1..>] [--sell-bps <1..=10000>] [--stop-loss-bps <BPS>]
                  [--max-total-cost <LAMPORTS>] [--legacy-create]
-                 [--live --confirm-live <PHRASE>]
+                 [--elapsed-ms <MS>] [--live --confirm-live <PHRASE>]
+    krypton init-state
     krypton help
 
 `check` validates the configuration, the payer keypair file (0600) and the
@@ -71,18 +72,26 @@ endpoints without touching the network. `exit` runs the exit of one position
 from the Yellowstone stream: a DRY RUN unless `--live` is given together with
 `--confirm-live` and the exact confirmation phrase, on top of the environment
 switches (DRY_RUN=false, LIVE_TRADING=true, LIVE_CONFIRM, MAX_SOL_PER_TX,
-DAILY_DRAWDOWN_SOL, PAYER_KEYPAIR_PATH). See README.md.
+DAILY_DRAWDOWN_SOL, PAYER_KEYPAIR_PATH, GUARD_STATE_PATH). `--elapsed-ms` says
+how long ago the coin was launched, so the 1 s to 10 s exit window is anchored at
+the launch and not at the moment this command starts. `init-state` creates the
+persisted spending-state file (GUARD_STATE_PATH) once; it never overwrites one.
+See README.md.
 ";
 
 /// Tranches of the exit unless `--tranches` says otherwise.
 pub const DEFAULT_TRANCHES: u8 = 4;
 /// Share of the position sold unless `--sell-bps` says otherwise: all of it.
 pub const DEFAULT_SELL_BPS: u16 = 10_000;
+/// Largest `--elapsed-ms` accepted: one hour. The exit window closes seconds
+/// after the launch, so anything longer is a typo or a unit mistake, and a
+/// session started that late could only drop every tranche.
+pub const MAX_ELAPSED_MS: u64 = 3_600_000;
 /// Orders beyond the tranches that the default cost budget allows (stop-loss
 /// sweeps).
 pub const DEFAULT_EXTRA_ORDERS: u64 = 2;
 
-const VALUE_FLAGS: [&str; 9] = [
+const VALUE_FLAGS: [&str; 10] = [
     "--confirm-live",
     "--mint",
     "--tokens",
@@ -92,6 +101,7 @@ const VALUE_FLAGS: [&str; 9] = [
     "--sell-bps",
     "--stop-loss-bps",
     "--max-total-cost",
+    "--elapsed-ms",
 ];
 const SWITCHES: [&str; 3] = ["--live", "--legacy-create", "--help"];
 
@@ -105,6 +115,7 @@ const FLAG_TRANCHES: &str = "--tranches";
 const FLAG_SELL_BPS: &str = "--sell-bps";
 const FLAG_STOP_LOSS: &str = "--stop-loss-bps";
 const FLAG_MAX_COST: &str = "--max-total-cost";
+const FLAG_ELAPSED: &str = "--elapsed-ms";
 const FLAG_LEGACY: &str = "--legacy-create";
 const FLAG_HELP: &str = "--help";
 
@@ -139,6 +150,10 @@ pub struct ExitArgs {
     pub max_total_cost_lamports: Option<u64>,
     /// The coin was created with the legacy `create` instruction.
     pub legacy_create: bool,
+    /// Milliseconds already elapsed since the launch (`--elapsed-ms`, default
+    /// 0): the exit window's zero is that long before the session starts
+    /// (audit finding #44).
+    pub elapsed_since_launch_ms: u64,
 }
 
 impl ExitArgs {
@@ -150,6 +165,22 @@ impl ExitArgs {
         } else {
             CreateVariant::CreateV2
         }
+    }
+
+    /// The zero of the exit window: `started` moved back by `--elapsed-ms`.
+    ///
+    /// `started` should be the instant the session began (before the barrier,
+    /// the blockhash fetch or the stream connection), so the time those take is
+    /// spent from the window, as it is in reality. An elapsed time longer than
+    /// the clock can represent (a process that started a minute ago cannot be
+    /// asked for an hour of history) falls back to `started` rather than
+    /// panicking, and the elapsed time is clamped to [`MAX_ELAPSED_MS`].
+    #[must_use]
+    pub fn genesis(&self, started: Instant) -> Instant {
+        let elapsed = self.elapsed_since_launch_ms.min(MAX_ELAPSED_MS);
+        started
+            .checked_sub(Duration::from_millis(elapsed))
+            .unwrap_or(started)
     }
 
     /// Builds the exit engine: an evenly spaced plan over the execution window
@@ -200,6 +231,8 @@ pub enum Command {
     Check,
     /// Run the exit of one position.
     Exit(ExitArgs),
+    /// Create the persisted spending-state file, once (audit finding #35).
+    InitState,
 }
 
 /// The parsed command line.
@@ -323,6 +356,16 @@ fn parse_exit(raw: &RawArgs) -> Result<ExitArgs, CliError> {
         stop_loss_bps: number(raw, FLAG_STOP_LOSS)?,
         max_total_cost_lamports: number(raw, FLAG_MAX_COST)?,
         legacy_create: raw.has(FLAG_LEGACY),
+        elapsed_since_launch_ms: match number::<u64>(raw, FLAG_ELAPSED)? {
+            Some(value) if value > MAX_ELAPSED_MS => {
+                return Err(CliError::InvalidValue {
+                    flag: FLAG_ELAPSED,
+                    reason: "must be at most 3600000 (one hour)",
+                })
+            }
+            Some(value) => value,
+            None => 0,
+        },
     })
 }
 
@@ -364,6 +407,12 @@ impl Cli {
                 Command::Check
             }
             Some("exit") => Command::Exit(parse_exit(&raw)?),
+            Some("init-state") => {
+                if live.requested || !raw.values.is_empty() || raw.has(FLAG_LEGACY) {
+                    return Err(CliError::UnknownArgument);
+                }
+                Command::InitState
+            }
             Some(_) => return Err(CliError::UnknownCommand),
         };
         Ok(Self { command, live })
@@ -688,7 +737,20 @@ pub fn summarize(report: &ExitReport) -> SessionSummary {
         interrupted: report.summary.interrupted,
         needs_attention: position.tokens_unresolved > 0
             || position.tokens_in_flight > 0
-            || report.summary.unsettled,
+            || report.summary.unsettled
+            || settlement_needs_attention(report.summary.balance),
+    }
+}
+
+/// Whether the end-of-run settlement of unknown orders left something to check:
+/// an order that did **not** sell (its tokens are still held) or tokens that
+/// left the account unexplained. A fully explained settlement needs nothing.
+fn settlement_needs_attention(outcome: BalanceOutcome) -> bool {
+    match outcome {
+        BalanceOutcome::Resolved(resolution) => {
+            resolution.unsold_orders > 0 || resolution.unexplained_tokens > 0
+        }
+        BalanceOutcome::NotNeeded | BalanceOutcome::Unavailable => false,
     }
 }
 

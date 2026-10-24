@@ -33,7 +33,9 @@ use krypton::execution::settings::{LiveSettings, LIVE_CONFIRM_PHRASE};
 use krypton::execution::tip::{TipBasis, TipBook, TipFloor, TipPolicy, Urgency};
 use krypton::execution::tip_feed::{TipFeedSettings, TipSource};
 use krypton::monitor::curve::PriceReference;
-use krypton::monitor::exit::{EngineSnapshot, ExitSummary, SellOrder, SellOutcome, SellSubmitter};
+use krypton::monitor::exit::{
+    BalanceOutcome, EngineSnapshot, ExitSummary, SellOrder, SellOutcome, SellSubmitter,
+};
 use krypton::monitor::geyser::{
     EventStream, HealthStatus, MonitorSettings, StreamTransport, StreamUpdate, SubscriptionRequest,
 };
@@ -141,6 +143,7 @@ fn exit_args() -> ExitArgs {
         stop_loss_bps: None,
         max_total_cost_lamports: None,
         legacy_create: false,
+        elapsed_since_launch_ms: 0,
     }
 }
 
@@ -365,6 +368,7 @@ fn armed_settings(path: Option<PathBuf>) -> LiveSettings {
         live_trading: true,
         confirmed: true,
         keypair_path: path,
+        guard_state_path: None,
         max_spend_per_tx_lamports: Some(1_000_000_000),
         daily_drawdown_lamports: Some(2_000_000_000),
     }
@@ -1134,6 +1138,7 @@ async fn a_dry_session_runs_from_the_stream_to_the_orders() -> TestResult {
             genesis: tokio::time::Instant::now(),
             monitor: MonitorSettings::default(),
             drain_timeout: Duration::from_secs(5),
+            balance: None,
         },
         None,
         shutdown,
@@ -1187,7 +1192,18 @@ fn armed_vars(path: &Path) -> HashMap<String, String> {
         vars.insert(name.to_owned(), value.to_owned());
     }
     vars.insert("LIVE_KEYPAIR_PATH".to_owned(), path.display().to_string());
+    vars.insert(
+        "GUARD_STATE_PATH".to_owned(),
+        path.with_file_name("guards.state").display().to_string(),
+    );
     vars
+}
+
+/// Creates the persisted spending state next to the keypair file, as
+/// `krypton init-state` does.
+fn init_guard_state(keypair: &Path) -> TestResult {
+    krypton::execution::persist::init_state(&keypair.with_file_name("guards.state"), 0)?;
+    Ok(())
 }
 
 #[test]
@@ -1220,6 +1236,7 @@ fn a_check_verifies_the_keypair_even_when_dry() -> TestResult {
 fn a_live_check_crosses_the_whole_barrier_without_the_network() -> TestResult {
     let dir = scratch("check-live")?;
     let path = write_keypair(&dir, "payer.json", 7, 0o600)?;
+    init_guard_state(&path)?;
     let config = Config::from_vars(armed_vars(&path))?;
     let report = check(&config, &live_request(Some(LIVE_CONFIRM_PHRASE)))?;
     assert_eq!(report.mode, Mode::Live);
@@ -1290,9 +1307,14 @@ async fn an_exit_without_a_yellowstone_endpoint_does_not_start() -> TestResult {
 #[cfg(not(feature = "grpc"))]
 #[tokio::test]
 async fn a_build_without_the_grpc_link_refuses_to_start_an_exit() -> TestResult {
+    // A live session crosses the barrier first (audit #46), so it needs a
+    // configuration that arms; the gRPC check comes right after.
+    let dir = scratch("nogrpc")?;
+    let path = write_keypair(&dir, "payer.json", 7, 0o600)?;
+    init_guard_state(&path)?;
     for mode in [Mode::Dry, Mode::Live] {
         let (_trigger, shutdown) = shutdown_channel();
-        let mut config = Config::from_vars(base_vars(true))?;
+        let mut config = Config::from_vars(armed_vars(&path))?;
         config.production = ProductionSettings::from_raw(raw(
             Some("https://grpc.example.com"),
             Some("abc123token"),
@@ -1340,6 +1362,7 @@ fn report(position: EngineSnapshot, unsettled: bool, interrupted: bool) -> ExitR
             decode_errors: 1,
             interrupted,
             unsettled,
+            balance: BalanceOutcome::NotNeeded,
         },
         health: HealthStatus {
             reconnects: 3,

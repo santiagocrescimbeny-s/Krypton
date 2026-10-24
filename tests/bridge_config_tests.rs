@@ -13,7 +13,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use krypton::config::{Config, ENV_KEYS, PRODUCTION_ENV_KEYS};
 use krypton::errors::{BridgeError, ConfigError};
-use krypton::network::rpc::{parse_blockhash_response, RpcBlockhashSource};
+use krypton::network::rpc::{
+    parse_blockhash_response, parse_token_balance_response, RpcBlockhashSource, RpcClient,
+};
 use reqwest::Url;
 use solana_keypair::Keypair;
 use solana_sdk::hash::Hash;
@@ -64,10 +66,11 @@ fn with(mut vars: HashMap<String, String>, name: &str, value: &str) -> HashMap<S
 fn the_core_key_list_is_unchanged_and_the_production_keys_are_separate() {
     // phase1_tests.rs pins the first list at 21: the bridge must not move it.
     assert_eq!(ENV_KEYS.len(), 21);
-    assert_eq!(PRODUCTION_ENV_KEYS.len(), 5);
+    assert_eq!(PRODUCTION_ENV_KEYS.len(), 6);
     let all: std::collections::HashSet<_> =
         ENV_KEYS.iter().chain(PRODUCTION_ENV_KEYS.iter()).collect();
-    assert_eq!(all.len(), 26, "the two lists overlap");
+    assert_eq!(all.len(), 27, "the two lists overlap");
+    assert!(PRODUCTION_ENV_KEYS.contains(&"GUARD_STATE_PATH"));
 }
 
 #[test]
@@ -362,5 +365,182 @@ fn the_source_accepts_http_urls_and_hides_them() -> TestResult {
         err_of(RpcBlockhashSource::new(&wrong))?,
         BridgeError::RpcConfig { .. }
     ));
+    Ok(())
+}
+
+// =====================================================================================================
+// Audit #47: https for the endpoints that carry orders and keys
+// =====================================================================================================
+
+#[test]
+fn plain_http_is_refused_for_rpc_and_jito_unless_the_host_is_loopback() -> TestResult {
+    let secret = "supersecretkey";
+    for name in ["RPC_URL", "JITO_ENGINE_URL"] {
+        for refused in [
+            format!("http://rpc.example.com/?api-key={secret}"),
+            format!("http://{secret}.example.com"),
+            "http://10.0.0.5:8899".to_owned(),
+            "http://localhost.evil.com".to_owned(),
+            "http://127.0.0.1.evil.com".to_owned(),
+        ] {
+            let error = err_of(Config::from_vars(with(minimal(), name, &refused)))?;
+            assert!(
+                matches!(error, ConfigError::InvalidVar { name: reported, .. } if reported == name),
+                "{name} {refused}: {error:?}"
+            );
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains(secret), "{name} echoed the URL: {text}");
+        }
+        for allowed in [
+            "https://rpc.example.com",
+            "https://rpc.example.com:8899/?api-key=k",
+            "http://localhost:8899",
+            "http://127.0.0.1:8899",
+            "http://[::1]:8899",
+        ] {
+            Config::from_vars(with(minimal(), name, allowed))
+                .map_err(|error| format!("{name} {allowed}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn other_schemes_stay_refused() -> TestResult {
+    for name in ["RPC_URL", "JITO_ENGINE_URL"] {
+        for refused in [
+            "ftp://rpc.example.com",
+            "wss://rpc.example.com",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                Config::from_vars(with(minimal(), name, refused)).is_err(),
+                "{name} {refused}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// =====================================================================================================
+// Audit #35: the state file path
+// =====================================================================================================
+
+#[test]
+fn the_guard_state_path_is_read_and_never_printed() -> TestResult {
+    let without = Config::from_vars(minimal())?;
+    assert!(without.live.guard_state_path.is_none());
+
+    let config = Config::from_vars(with(
+        minimal(),
+        "GUARD_STATE_PATH",
+        "  /var/lib/krypton/secret-dir/guards.state  ",
+    ))?;
+    assert_eq!(
+        config.live.guard_state_path.as_deref(),
+        Some(std::path::Path::new(
+            "/var/lib/krypton/secret-dir/guards.state"
+        ))
+    );
+    assert!(!format!("{config:?}").contains("secret-dir"));
+
+    let blank = Config::from_vars(with(minimal(), "GUARD_STATE_PATH", "   "))?;
+    assert!(
+        blank.live.guard_state_path.is_none(),
+        "blank counts as unset"
+    );
+    Ok(())
+}
+
+// =====================================================================================================
+// Audit #45: getTokenAccountBalance
+// =====================================================================================================
+
+fn balance_answer(amount: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":{{"amount":"{amount}","decimals":6,"uiAmount":1.0,"uiAmountString":"1"}}}},"id":1}}"#
+    )
+}
+
+#[test]
+fn a_gettokenaccountbalance_answer_is_parsed_in_base_units() -> TestResult {
+    assert_eq!(
+        parse_token_balance_response(balance_answer("0").as_bytes())?,
+        0
+    );
+    assert_eq!(
+        parse_token_balance_response(balance_answer("97500000000003").as_bytes())?,
+        97_500_000_000_003
+    );
+    // Above 2^53: the amount is a string precisely so it stays exact.
+    assert_eq!(
+        parse_token_balance_response(balance_answer("18446744073709551615").as_bytes())?,
+        u64::MAX
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unusable_balance_answer_is_malformed_never_zero() -> TestResult {
+    for body in [
+        String::new(),
+        "not json".to_owned(),
+        r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid param: could not find account"},"id":1}"#
+            .to_owned(),
+        r#"{"jsonrpc":"2.0","result":{"value":{}},"id":1}"#.to_owned(),
+        r#"{"jsonrpc":"2.0","result":{"value":{"amount":5}},"id":1}"#.to_owned(),
+        balance_answer("-1"),
+        balance_answer("1.5"),
+        balance_answer("18446744073709551616"),
+        balance_answer(""),
+        balance_answer("0x10"),
+    ] {
+        assert_eq!(
+            err_of(parse_token_balance_response(body.as_bytes()))?,
+            BridgeError::RpcMalformed,
+            "{body}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn balance_errors_carry_no_remote_text() -> TestResult {
+    let body = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"REMOTE-TEXT-secret"},"id":1}"#;
+    let error = err_of(parse_token_balance_response(body.as_bytes()))?;
+    assert!(!format!("{error} {error:?}").contains("REMOTE-TEXT"));
+    Ok(())
+}
+
+#[test]
+fn the_rpc_client_enforces_the_transport_policy_and_hides_its_url() -> TestResult {
+    let secret = Url::parse("https://rpc.example.com/?api-key=SECRET-KEY")?;
+    let client = RpcClient::new(&secret)?;
+    assert!(!format!("{client:?}").contains("SECRET-KEY"));
+    for local in [
+        "http://127.0.0.1:8899",
+        "http://localhost:8899",
+        "http://[::1]:8899",
+    ] {
+        assert!(RpcClient::new(&Url::parse(local)?).is_ok(), "{local}");
+    }
+    for refused in [
+        "http://rpc.example.com",
+        "http://10.0.0.5:8899",
+        "wss://rpc.example.com",
+        "ftp://rpc.example.com",
+    ] {
+        assert!(
+            matches!(
+                err_of(RpcClient::new(&Url::parse(refused)?))?,
+                BridgeError::RpcConfig { .. }
+            ),
+            "{refused}"
+        );
+        assert!(
+            RpcBlockhashSource::new(&Url::parse(refused)?).is_err(),
+            "{refused}"
+        );
+    }
     Ok(())
 }

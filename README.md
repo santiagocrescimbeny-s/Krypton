@@ -93,11 +93,25 @@ explícitamente.
 | `LIVE_TRADING` | `true` |
 | `LIVE_CONFIRM` | exactamente `I-UNDERSTAND-REAL-FUNDS-WILL-BE-SPENT` (en mayúsculas) |
 | `LIVE_KEYPAIR_PATH` | archivo regular (no *symlink*), modo `600` en Unix, ≤ 4 KiB; su clave pública debe coincidir con `PRIVATE_KEY` |
+| `GUARD_STATE_PATH` | archivo de estado de gasto **ya creado** con `krypton init-state` (ver abajo); si falta, está corrupto, ilegible, con permisos distintos de `600` o lo usa otro proceso, no se arma |
 | `MAX_SOL_PER_TX` | > 0 y ≤ 10 SOL (tope por transacción) |
 | `DAILY_DRAWDOWN_SOL` | ≥ `MAX_SOL_PER_TX` y ≤ 50 SOL (límite diario neto) |
 
 Además, `SLIPPAGE_BPS` ≤ 1000 (10 %) se vuelve a comprobar en la barrera, y el tip dinámico nunca supera `MAX_JITO_TIP_LAMPORTS`.
 `ENV_KEYS` pasa de 16 a 21 claves. Los mensajes de error no incluyen rutas ni valores.
+
+#### Estado de gasto persistente (hallazgo #35)
+
+El día contable (UTC), el gasto comprometido, lo devuelto por las ventas y el *latch* de parada (`halted`) se guardan en `GUARD_STATE_PATH`:
+un reinicio ya no regala un día nuevo ni borra el *tripwire*. Formato de texto canónico con *checksum* (un archivo truncado o editado a mano se
+rechaza), escritura atómica (`<archivo>.tmp` creado `0600` + `fsync` + `rename` + `fsync` del directorio) desde un hilo en segundo plano: la
+ruta de envío nunca espera al disco. Un candado exclusivo (`<archivo>.lock`) impide que dos procesos compartan las cuentas (también `check --live`
+mientras corre una sesión). Si el disco falla, las **entradas** se rechazan (`GuardError::PersistenceFailed`); las salidas nunca se bloquean, y se
+reintenta solo.
+
+- Primera vez: `krypton init-state` (nunca sobrescribe). Para «olvidar» el día a propósito (p. ej. tras revisar un `halted`), se borra el archivo y se vuelve a ejecutar.
+- Al cambiar de día se reinician los contadores pero **no** el `halted`. Un registro con fecha futura (reloj atrasado) no arma.
+- Las reservas en vuelo no se persisten: tras una caída, concilia a mano las órdenes que estaban en curso (exposición ≤ tope por transacción × órdenes en vuelo).
 
 ### Puente de producción: el binario `krypton`
 
@@ -105,12 +119,29 @@ Además, `SLIPPAGE_BPS` ≤ 1000 (10 %) se vuelve a comprobar en la barrera, y e
 cargo run --release -- check                      # valida configuración, archivo de clave (0600) y endpoints; sin red
 cargo run --release -- exit --mint <MINT> --tokens <UNIDADES> \
     --entry-sol-reserves <LAMPORTS> --entry-token-reserves <UNIDADES>   # ensayo (dry): nada sale del proceso
+cargo run --release -- init-state                 # crea GUARD_STATE_PATH una vez (nunca sobrescribe)
 ```
 
-Variables nuevas (todas opcionales; ver `.env.example`): `YELLOWSTONE_ENDPOINT`, `YELLOWSTONE_X_TOKEN` (se elimina del entorno al leerla),
+`exit --elapsed-ms <MS>` (hallazgo #44, máx. 3 600 000): milisegundos que lleva ya el coin en vida. La ventana de salida de 1 s a 10 s se ancla en
+`inicio de la sesión − MS`, no en el momento en que arranca el comando; el tiempo de arranque (barrera, blockhash, conexión) cuenta contra la ventana.
+Sin la bandera vale 0.
+
+**Orden de arranque (#46).** En modo vivo, `LiveExecutor::arm` (barrera completa, archivo de clave y estado de gasto) es lo primero que ocurre,
+antes de cualquier E/S de red y de lanzar tareas: una sesión que no puede armarse no deja rastro en la red.
+
+**Resultados desconocidos (#45).** Al terminar, si quedan órdenes con resultado desconocido, el gestor lee el saldo confirmado (`confirmed`) de la
+ATA del wallet (`getTokenAccountBalance`) y las resuelve con `ExitEngine::resolve_from_balance`: lo que falta respecto a `posición − vendido` se
+asigna a las órdenes desconocidas por orden de secuencia; un faltante que ninguna explica (o una orden que no se vendió) deja `needs_attention` y el
+código de salida 3. Si el saldo no se puede leer, las órdenes siguen sin resolver. **`Invalid` (#37):** el Block Engine puede responder `Invalid`
+mientras indexa un bundle recién aceptado, así que se reintenta suavemente en las 3 primeras comprobaciones; `Failed` sigue siendo final.
+
+**Transporte seguro (#47).** `RPC_URL` y `JITO_ENGINE_URL` exigen `https://`; `http://` solo hacia `localhost`, `127.0.0.1` o `[::1]`. El error nombra la
+variable, nunca la URL.
+
+Variables nuevas (todas opcionales; ver `.env.example`; `GUARD_STATE_PATH` es obligatoria solo para armar el modo vivo): `GUARD_STATE_PATH`, `YELLOWSTONE_ENDPOINT`, `YELLOWSTONE_X_TOKEN` (se elimina del entorno al leerla),
 `JITO_BLOCK_ENGINE_URL` (alias de `JITO_ENGINE_URL`), `JITO_TIP_STREAM_URL` (URL **HTTP** del `tip_floor`; un WebSocket se rechaza) y
 `PAYER_KEYPAIR_PATH` (alias de `LIVE_KEYPAIR_PATH`). Con dos nombres a la vez deben coincidir; si no, error. `ENV_KEYS` sigue en 21; las
-cinco nuevas están en `PRODUCTION_ENV_KEYS`.
+seis nuevas están en `PRODUCTION_ENV_KEYS`.
 
 **Barrera dry→live del proceso.** Sin `--live` el binario *siempre* corre en seco, aunque el entorno esté armado. Para gastar fondos reales hace falta
 a la vez: `--live --confirm-live I-UNDERSTAND-REAL-FUNDS-WILL-BE-SPENT`, `DRY_RUN=false`, `LIVE_TRADING=true`, `LIVE_CONFIRM` con la misma frase,

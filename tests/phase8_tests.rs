@@ -1319,6 +1319,7 @@ async fn the_yellowstone_transport_drives_a_live_exit() -> TestResult {
                 blockhash,
                 monitor: MonitorSettings::default(),
                 drain_timeout: Duration::from_secs(5),
+                balance: None,
             },
             shutdown,
         )

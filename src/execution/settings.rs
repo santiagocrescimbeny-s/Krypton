@@ -16,6 +16,9 @@ pub const ENV_LIVE_TRADING: &str = "LIVE_TRADING";
 pub const ENV_LIVE_CONFIRM: &str = "LIVE_CONFIRM";
 /// Path of the keypair file live trading signs with.
 pub const ENV_LIVE_KEYPAIR_PATH: &str = "LIVE_KEYPAIR_PATH";
+/// Path of the persisted spending state (see [`super::persist`]). Required to
+/// arm live trading.
+pub const ENV_GUARD_STATE_PATH: &str = "GUARD_STATE_PATH";
 /// Per-transaction spending cap, in SOL.
 pub const ENV_MAX_SOL_PER_TX: &str = "MAX_SOL_PER_TX";
 /// Daily net-spend (drawdown) limit, in SOL.
@@ -39,6 +42,8 @@ pub struct RawLiveSettings {
     pub live_confirm: Option<String>,
     /// `LIVE_KEYPAIR_PATH`.
     pub live_keypair_path: Option<String>,
+    /// `GUARD_STATE_PATH`.
+    pub guard_state_path: Option<String>,
     /// `MAX_SOL_PER_TX`.
     pub max_sol_per_tx: Option<String>,
     /// `DAILY_DRAWDOWN_SOL`.
@@ -54,6 +59,8 @@ pub struct LiveSettings {
     pub confirmed: bool,
     /// The keypair file live trading signs with.
     pub keypair_path: Option<PathBuf>,
+    /// The persisted spending state file.
+    pub guard_state_path: Option<PathBuf>,
     /// Per-transaction cap, in lamports.
     pub max_spend_per_tx_lamports: Option<u64>,
     /// Daily drawdown limit, in lamports.
@@ -67,6 +74,7 @@ impl std::fmt::Debug for LiveSettings {
             .field("live_trading", &self.live_trading)
             .field("confirmed", &self.confirmed)
             .field("keypair_path", &self.keypair_path.is_some())
+            .field("guard_state_path", &self.guard_state_path.is_some())
             .field("max_spend_per_tx_lamports", &self.max_spend_per_tx_lamports)
             .field("daily_drawdown_lamports", &self.daily_drawdown_lamports)
             .finish()
@@ -141,6 +149,7 @@ impl LiveSettings {
             live_trading,
             confirmed,
             keypair_path: clean(raw.live_keypair_path).map(PathBuf::from),
+            guard_state_path: clean(raw.guard_state_path).map(PathBuf::from),
             max_spend_per_tx_lamports: parse_limit(
                 ENV_MAX_SOL_PER_TX,
                 raw.max_sol_per_tx,

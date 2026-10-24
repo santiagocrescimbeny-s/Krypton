@@ -44,6 +44,18 @@ bytes = "1"
 # HTTP (rustls only: no OpenSSL / system TLS dependency, friendly to Windows builds).
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 
+# gRPC link (feature `grpc`, audit finding #48): PLACEHOLDERS, not used by any package yet.
+# Cargo only resolves workspace dependencies that a package actually uses, so declaring them
+# here leaves `Cargo.lock` and the offline `--locked` gates untouched (checked with cargo
+# 1.97: no lock entry, no warning). `"*"` is a stand-in: when enabling the link, replace each
+# with the exact release that shares one `tonic` and matches the Solana generation above
+# (`cargo add` / `cargo info` on a machine that reaches crates.io), and give `tonic` its
+# TLS-roots feature (its name depends on the version: `tls-native-roots`, `tls-roots`, ...).
+# `tests/manifest_tests.rs` keeps the manifest and the lockfile consistent either way.
+yellowstone-grpc-proto = { version = "*", default-features = false }
+tonic = { version = "*", default-features = false }
+tokio-stream = { version = "*", default-features = false }
+
 # Observability.
 tracing = "0.1"
 tracing-appender = "0.2"
@@ -63,14 +75,24 @@ publish.workspace = true
 rust-version = "1.97.1"
 
 [features]
-# The `tonic` Yellowstone link (`src/network/grpc.rs`). It declares no dependencies
-# on purpose: the default build, and Cargo.lock, do not change. To use it, add
-# `yellowstone-grpc-proto`, `tonic` and `tokio-stream` as dependencies on a machine
-# that can reach crates.io (see docs/yellowstone-adapter.md), then build with
-# `--features grpc`.
+# The `tonic` Yellowstone link (`src/network/grpc.rs`). While it is `[]` it pulls no
+# dependency: the default build, and Cargo.lock, do not change.
+#
+# TO ENABLE (a machine that reaches crates.io; docs/yellowstone-adapter.md has the whole
+# procedure), do these three edits together, then `cargo update -w` and commit the lock:
+#   1. replace the line below with:
+#        grpc = ["dep:yellowstone-grpc-proto", "dep:tonic", "dep:tokio-stream"]
+#   2. pin the three placeholders in `[workspace.dependencies]` above;
+#   3. uncomment the three optional dependencies in `[dependencies]` below.
+# Default builds still compile without them: `optional = true` keeps them out of the code
+# unless `--features grpc` is given (they only appear in Cargo.lock, which is committed).
 grpc = []
 
 [dependencies]
+# gRPC link, optional (see `[features]` for the three edits that enable it):
+# yellowstone-grpc-proto = { workspace = true, optional = true }
+# tonic = { workspace = true, optional = true }
+# tokio-stream = { workspace = true, optional = true }
 tokio = { workspace = true }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }

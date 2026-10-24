@@ -22,12 +22,21 @@
 //!
 //! Time is an argument (`now_secs`, seconds since the Unix epoch), never read
 //! here, which keeps the guards deterministic and testable.
+//!
+//! # Persistence (audit finding #35)
+//! The day, the committed and returned spend and the halt latch can be kept on
+//! disk: [`SpendingGuards::restore`] rebuilds the books from a
+//! [`PersistedGuards`] record and [`SpendingGuards::with_persistence`] hands
+//! every change to a background [`StateWriter`] (see [`super::persist`]). While
+//! the record cannot be written, entries are refused with
+//! [`GuardError::PersistenceFailed`]; exits are never blocked.
 
 use std::sync::Mutex;
 
 use crate::config::MAX_SLIPPAGE_BPS;
 use crate::errors::GuardError;
 
+use super::persist::{PersistedGuards, StateWriter};
 use super::settings::{ABSOLUTE_MAX_DAILY_DRAWDOWN_LAMPORTS, ABSOLUTE_MAX_SPEND_PER_TX_LAMPORTS};
 
 /// Seconds in the accounting day (UTC).
@@ -179,6 +188,15 @@ impl State {
             .saturating_sub(self.returned.min(self.committed))
     }
 
+    fn persisted(&self) -> PersistedGuards {
+        PersistedGuards {
+            day: self.day.unwrap_or(0),
+            committed_lamports: self.committed,
+            returned_lamports: self.returned,
+            halted: self.halted,
+        }
+    }
+
     fn snapshot(&self) -> GuardSnapshot {
         GuardSnapshot {
             day: self.day.unwrap_or(0),
@@ -196,6 +214,7 @@ impl State {
 pub struct SpendingGuards {
     limits: GuardLimits,
     state: Mutex<State>,
+    writer: Option<StateWriter>,
 }
 
 impl SpendingGuards {
@@ -205,6 +224,88 @@ impl SpendingGuards {
         Self {
             limits,
             state: Mutex::new(State::default()),
+            writer: None,
+        }
+    }
+
+    /// Guards that continue from a persisted record.
+    ///
+    /// - A record of an earlier day keeps only its halt latch (the counters
+    ///   belong to a day that is over).
+    /// - A record of today keeps everything.
+    /// - If the restored net spend already reaches the daily limit (the limit
+    ///   may have been lowered since), the guards come up halted.
+    ///
+    /// # Errors
+    /// [`GuardError::PersistedStateInFuture`] when the record is dated after
+    /// `now_secs`: the clock went backwards or the file is not ours, and
+    /// trusting either would let the day's spend be forgotten.
+    pub fn restore(
+        limits: GuardLimits,
+        saved: &PersistedGuards,
+        now_secs: u64,
+    ) -> Result<Self, GuardError> {
+        let today = now_secs / SECONDS_PER_DAY;
+        if saved.day > today {
+            return Err(GuardError::PersistedStateInFuture);
+        }
+        let mut state = State {
+            day: Some(today),
+            halted: saved.halted,
+            ..State::default()
+        };
+        if saved.day == today {
+            state.committed = saved.committed_lamports;
+            state.returned = saved.returned_lamports;
+        }
+        if state.realised() >= limits.daily_drawdown_lamports {
+            state.halted = true;
+        }
+        Ok(Self {
+            limits,
+            state: Mutex::new(state),
+            writer: None,
+        })
+    }
+
+    /// Hands every future change of the books to `writer`.
+    ///
+    /// The current books are queued immediately, so the file reflects any
+    /// adjustment [`SpendingGuards::restore`] made (a day rollover, a halt).
+    ///
+    /// # Errors
+    /// [`GuardError::StatePoisoned`].
+    pub fn with_persistence(mut self, writer: StateWriter) -> Result<Self, GuardError> {
+        writer.submit(self.lock()?.persisted());
+        self.writer = Some(writer);
+        Ok(self)
+    }
+
+    /// The part of the books that is persisted.
+    ///
+    /// # Errors
+    /// [`GuardError::StatePoisoned`].
+    pub fn persisted(&self) -> Result<PersistedGuards, GuardError> {
+        Ok(self.lock()?.persisted())
+    }
+
+    /// Waits until the background writer has attempted everything queued; `true`
+    /// when the newest books are on disk (also `true` without persistence).
+    /// Blocking: call it from `spawn_blocking` at shutdown.
+    #[must_use]
+    pub fn flush_persistence(&self) -> bool {
+        self.writer.as_ref().is_none_or(StateWriter::flush)
+    }
+
+    fn persistence_failed(&self) -> bool {
+        self.writer.as_ref().is_some_and(StateWriter::has_failed)
+    }
+
+    /// Queues the books for writing. Called with the lock held, so records reach
+    /// the writer in the order the changes happened.
+    fn notify(&self, state: &State) {
+        if let Some(writer) = &self.writer {
+            writer.submit(state.persisted());
         }
     }
 
@@ -253,6 +354,9 @@ impl SpendingGuards {
             if state.halted {
                 return Err(GuardError::Halted);
             }
+            if self.persistence_failed() {
+                return Err(GuardError::PersistenceFailed);
+            }
             let projected = state
                 .realised()
                 .saturating_add(state.reserved)
@@ -279,6 +383,7 @@ impl SpendingGuards {
         if state.realised() >= self.limits.daily_drawdown_lamports {
             state.halted = true;
         }
+        self.notify(&state);
         Ok(())
     }
 
@@ -301,6 +406,7 @@ impl SpendingGuards {
         let mut state = self.lock()?;
         state.roll(now_secs);
         state.returned = state.returned.saturating_add(lamports);
+        self.notify(&state);
         Ok(())
     }
 
@@ -310,7 +416,9 @@ impl SpendingGuards {
     /// # Errors
     /// [`GuardError::StatePoisoned`].
     pub fn rearm(&self) -> Result<(), GuardError> {
-        self.lock()?.halted = false;
+        let mut state = self.lock()?;
+        state.halted = false;
+        self.notify(&state);
         Ok(())
     }
 

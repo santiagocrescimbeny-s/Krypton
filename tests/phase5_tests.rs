@@ -41,6 +41,7 @@ use krypton::monitor::exit::{
     SellSubmitter, Tranche, EXIT_WINDOW_END_MS, EXIT_WINDOW_START_MS, MAX_LATENESS_MS,
     MAX_STOP_LOSS_ORDERS, MAX_TRANCHES, ORDER_CHANNEL_CAPACITY, UNRESOLVED_PROJECTION_SLOTS,
 };
+use krypton::monitor::exit::{BalanceOutcome, BalanceReader, BalanceResolution};
 use krypton::monitor::geyser::{
     AccountUpdate, Backoff, BackoffPolicy, ConnectionState, EventStream, GeyserMonitor,
     HealthStatus, InstructionUpdate, MonitorSettings, PumpInstructionKind, StreamCommitment,
@@ -3488,4 +3489,265 @@ fn error_labels_are_static_and_value_free() {
         .label(),
         "budget_exceeded"
     );
+}
+
+// --- Settling unknown outcomes from the token account (audit finding #45) ----------------------
+
+#[test]
+fn an_unknown_order_whose_tokens_left_the_account_is_settled_as_sold() -> Result<(), Box<dyn Error>>
+{
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+
+    let resolution = engine
+        .resolve_from_balance(POSITION - TRANCHE_TOKENS)
+        .ok_or("nothing was resolved")?;
+    assert_eq!(
+        resolution,
+        BalanceResolution {
+            sold_orders: 1,
+            unsold_orders: 0,
+            unexplained_tokens: 0
+        }
+    );
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_sold, TRANCHE_TOKENS);
+    assert_eq!(snapshot.tokens_unresolved, 0);
+    assert_eq!(accounted(&snapshot), POSITION);
+    Ok(())
+}
+
+#[test]
+fn an_unknown_order_whose_tokens_are_still_there_is_settled_as_unsold() -> Result<(), Box<dyn Error>>
+{
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+
+    // The balance is higher than expected, which also reads as "not sold".
+    for balance in [POSITION, POSITION + 1_000] {
+        let mut engine = engine_with(four_tranches(None)?, exit_settings())?;
+        let first = issue_first(&mut engine)?;
+        report(&mut engine, &first, SellOutcome::Unknown);
+        let resolution = engine
+            .resolve_from_balance(balance)
+            .ok_or("nothing was resolved")?;
+        assert_eq!(resolution.sold_orders, 0);
+        assert_eq!(resolution.unsold_orders, 1);
+        assert_eq!(resolution.unexplained_tokens, 0);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.tokens_sold, 0);
+        assert_eq!(snapshot.tokens_unresolved, 0);
+        assert_eq!(accounted(&snapshot), POSITION);
+    }
+    Ok(())
+}
+
+#[test]
+fn tokens_missing_beyond_the_unknown_orders_are_reported_not_absorbed() -> Result<(), Box<dyn Error>>
+{
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+    let resolution = engine
+        .resolve_from_balance(POSITION - TRANCHE_TOKENS - 7)
+        .ok_or("nothing was resolved")?;
+    assert_eq!(resolution.sold_orders, 1);
+    assert_eq!(resolution.unexplained_tokens, 7);
+
+    // Less missing than one order: not sold, and the shortfall is unexplained.
+    let mut engine = engine_with(four_tranches(None)?, exit_settings())?;
+    let first = issue_first(&mut engine)?;
+    report(&mut engine, &first, SellOutcome::Unknown);
+    let resolution = engine
+        .resolve_from_balance(POSITION - 5)
+        .ok_or("nothing was resolved")?;
+    assert_eq!(resolution.unsold_orders, 1);
+    assert_eq!(resolution.unexplained_tokens, 5);
+    Ok(())
+}
+
+#[test]
+fn several_unknown_orders_are_settled_in_sequence_order() -> Result<(), Box<dyn Error>> {
+    let mut engine = engine()?;
+    let first = issue_first(&mut engine)?;
+    let second = engine
+        .poll(4_000)
+        .orders
+        .first()
+        .copied()
+        .ok_or("second order")?;
+    report(&mut engine, &second, SellOutcome::Unknown);
+    report(&mut engine, &first, SellOutcome::Unknown);
+    assert_eq!(engine.snapshot().tokens_unresolved, 2 * TRANCHE_TOKENS);
+
+    // One tranche left the account: the earlier order takes the credit.
+    let resolution = engine
+        .resolve_from_balance(POSITION - TRANCHE_TOKENS)
+        .ok_or("nothing was resolved")?;
+    assert_eq!((resolution.sold_orders, resolution.unsold_orders), (1, 1));
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.tokens_sold, TRANCHE_TOKENS);
+    assert_eq!(snapshot.tokens_unresolved, 0);
+    assert_eq!(accounted(&snapshot), POSITION);
+    Ok(())
+}
+
+#[test]
+fn nothing_is_settled_without_unknown_orders_or_with_unreported_ones() -> Result<(), Box<dyn Error>>
+{
+    let mut engine = engine()?;
+    assert_eq!(engine.resolve_from_balance(0), None, "nothing issued");
+
+    let first = issue_first(&mut engine)?;
+    assert_eq!(
+        engine.resolve_from_balance(0),
+        None,
+        "the order is still awaiting its report"
+    );
+    report(&mut engine, &first, SellOutcome::Landed { slot: 11 });
+    assert_eq!(engine.resolve_from_balance(0), None, "no unknown order");
+    assert_eq!(engine.snapshot().tokens_sold, TRANCHE_TOKENS);
+
+    // An unknown order plus another still unreported: tokens cannot be told apart.
+    let second = engine
+        .poll(4_000)
+        .orders
+        .first()
+        .copied()
+        .ok_or("second order")?;
+    let third = engine
+        .poll(7_000)
+        .orders
+        .first()
+        .copied()
+        .ok_or("third order")?;
+    report(&mut engine, &second, SellOutcome::Unknown);
+    assert!(third.sequence > second.sequence);
+    assert_eq!(engine.resolve_from_balance(0), None);
+    assert_eq!(
+        engine.snapshot().tokens_unresolved,
+        TRANCHE_TOKENS,
+        "unchanged"
+    );
+    Ok(())
+}
+
+fn start_exit_with_reader(
+    script: Vec<Option<SellOutcome>>,
+    reader: Option<BalanceReader>,
+) -> Result<ExitRun, Box<dyn Error>> {
+    let genesis = Instant::now();
+    let engine = engine_with(four_tranches(None)?, exit_settings())?;
+    let mut manager =
+        ExitManager::new(engine, curve_key(), genesis).with_settle_timeout(Duration::from_secs(5));
+    if let Some(reader) = reader {
+        manager = manager.with_balance_reader(reader);
+    }
+    let recorder = Recorder::new(genesis, script, Duration::ZERO);
+    let (orders_tx, orders_rx) = order_channel();
+    let (reports_tx, reports_rx) = report_channel();
+    let (updates, updates_rx) = mpsc::channel(16);
+    let (trigger, signal) = shutdown_channel();
+    let executor = tokio::spawn(run_sell_executor(
+        Arc::clone(&recorder),
+        orders_rx,
+        reports_tx,
+        signal.clone(),
+        Duration::from_secs(5),
+    ));
+    let manager = tokio::spawn(manager.run(updates_rx, orders_tx, reports_rx, signal));
+    Ok(ExitRun {
+        updates,
+        manager,
+        executor,
+        recorder,
+        trigger,
+        genesis,
+    })
+}
+
+async fn run_with_reader(
+    reader: Option<BalanceReader>,
+) -> Result<krypton::monitor::exit::ExitSummary, Box<dyn Error>> {
+    let run = start_exit_with_reader(vec![Some(SellOutcome::Unknown)], reader)?;
+    run.updates
+        .send(curve_update(10, &post_buy_spec()?))
+        .await?;
+    run.finish().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_manager_settles_unknown_orders_from_the_balance_when_the_run_ends(
+) -> Result<(), Box<dyn Error>> {
+    // The three other tranches landed, so the account holds exactly the unknown
+    // tranche if that one did not sell, and nothing if it did.
+    let sold = run_with_reader(Some(BalanceReader::new(|| async { Some(0) }))).await?;
+    assert_eq!(
+        sold.balance,
+        BalanceOutcome::Resolved(BalanceResolution {
+            sold_orders: 1,
+            unsold_orders: 0,
+            unexplained_tokens: 0
+        })
+    );
+    assert_eq!(sold.position.tokens_unresolved, 0);
+    assert_eq!(sold.position.tokens_sold, POSITION);
+
+    let unsold =
+        run_with_reader(Some(BalanceReader::new(|| async { Some(TRANCHE_TOKENS) }))).await?;
+    assert_eq!(
+        unsold.balance,
+        BalanceOutcome::Resolved(BalanceResolution {
+            sold_orders: 0,
+            unsold_orders: 1,
+            unexplained_tokens: 0
+        })
+    );
+    assert_eq!(unsold.position.tokens_unresolved, 0);
+    assert_eq!(unsold.position.tokens_sold, POSITION - TRANCHE_TOKENS);
+    assert_eq!(unsold.position.tokens_unsold, TRANCHE_TOKENS);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_or_slow_balance_leaves_the_unknown_orders_unresolved(
+) -> Result<(), Box<dyn Error>> {
+    let unreadable = run_with_reader(Some(BalanceReader::new(|| async { None }))).await?;
+    assert_eq!(unreadable.balance, BalanceOutcome::Unavailable);
+    assert_eq!(unreadable.position.tokens_unresolved, TRANCHE_TOKENS);
+
+    // A reader that never answers is cut off by the read timeout.
+    let slow = run_with_reader(Some(BalanceReader::new(|| async {
+        sleep(Duration::from_secs(3_600)).await;
+        Some(0)
+    })))
+    .await?;
+    assert_eq!(slow.balance, BalanceOutcome::Unavailable);
+    assert_eq!(slow.position.tokens_unresolved, TRANCHE_TOKENS);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_reader_or_without_unknown_orders_the_balance_is_never_read(
+) -> Result<(), Box<dyn Error>> {
+    let without_reader = run_with_reader(None).await?;
+    assert_eq!(without_reader.balance, BalanceOutcome::NotNeeded);
+    assert_eq!(without_reader.position.tokens_unresolved, TRANCHE_TOKENS);
+
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
+    let reader = BalanceReader::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async { Some(0) }
+    });
+    let run = start_exit_with_reader(vec![], Some(reader))?;
+    run.updates
+        .send(curve_update(10, &post_buy_spec()?))
+        .await?;
+    let clean = run.finish().await?;
+    assert_eq!(clean.balance, BalanceOutcome::NotNeeded);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    Ok(())
 }

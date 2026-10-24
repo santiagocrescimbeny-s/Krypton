@@ -44,7 +44,14 @@
 //! [`ExitEngine::resolve_unknown`] settles it once the caller has read the
 //! token account. Its price impact stays in the quotes for
 //! [`UNRESOLVED_PROJECTION_SLOTS`] slots, after which it can no longer land.
+//!
+//! At the end of a run the manager does that reading itself when it was given a
+//! [`BalanceReader`] (audit finding #45): [`ExitEngine::resolve_from_balance`]
+//! compares the confirmed balance with what the position should hold if none of
+//! the unknown orders landed, and settles each of them.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +94,8 @@ pub const REPORT_CHANNEL_CAPACITY: usize = ORDER_CHANNEL_CAPACITY * 2;
 /// Default time the manager keeps waiting for execution reports after the
 /// window has closed.
 pub const DEFAULT_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the end-of-run token balance read may take.
+pub const BALANCE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 const FULL_POSITION_BPS: u16 = 10_000;
 const BPS_DENOMINATOR: u128 = 10_000;
@@ -406,6 +415,61 @@ pub struct EngineSnapshot {
     pub committed_cost_lamports: u64,
 }
 
+/// The boxed future a [`BalanceReader`] returns.
+pub type BalanceFuture = Pin<Box<dyn Future<Output = Option<u64>> + Send>>;
+
+/// Reads the confirmed token balance of the position's account, in base units.
+/// `None` means "could not be read" (transport error, missing account, timeout
+/// inside the reader): the unknown orders then stay unresolved.
+#[derive(Clone)]
+pub struct BalanceReader(Arc<dyn Fn() -> BalanceFuture + Send + Sync>);
+
+impl BalanceReader {
+    /// Wraps an async function.
+    pub fn new<F, Fut>(read: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<u64>> + Send + 'static,
+    {
+        Self(Arc::new(move || -> BalanceFuture { Box::pin(read()) }))
+    }
+
+    async fn read(&self) -> Option<u64> {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for BalanceReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BalanceReader").finish_non_exhaustive()
+    }
+}
+
+/// What [`ExitEngine::resolve_from_balance`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BalanceResolution {
+    /// Unknown orders settled as sold.
+    pub sold_orders: u32,
+    /// Unknown orders settled as not sold (their tokens are still held).
+    pub unsold_orders: u32,
+    /// Tokens that left the account beyond what the unknown orders explain
+    /// (a transfer, another process, a mistaken `--tokens`).
+    pub unexplained_tokens: u64,
+}
+
+/// How the end-of-run settlement of unknown orders went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BalanceOutcome {
+    /// Nothing was unknown, or no reader was configured.
+    #[default]
+    NotNeeded,
+    /// The balance was read and the unknown orders were settled.
+    Resolved(BalanceResolution),
+    /// There were unknown orders but they could not be settled (no balance, or
+    /// orders still unreported). They stay unresolved.
+    Unavailable,
+}
+
 // --- Engine ------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,6 +652,40 @@ impl ExitEngine {
             self.in_flight.retain(|flight| flight.sequence != sequence);
         }
         true
+    }
+
+    /// Settles every unresolved order from the confirmed token `balance`.
+    ///
+    /// If none of the unknown orders had landed, the account would hold
+    /// `position - sold`; whatever is missing from `balance` left through them.
+    /// That amount is assigned to the unknown orders in sequence order: an order
+    /// is *sold* when the remaining departed amount covers it. A remainder that
+    /// no order explains is reported, never absorbed.
+    ///
+    /// Returns `None`, changing nothing, when there is nothing to settle or when
+    /// some order is still unreported (its tokens would be mistaken for an
+    /// unknown order's).
+    pub fn resolve_from_balance(&mut self, balance: u64) -> Option<BalanceResolution> {
+        if self.unresolved.is_empty() || self.has_unreported() {
+            return None;
+        }
+        let expected = self.position.tokens.saturating_sub(self.sold);
+        let mut departed = expected.saturating_sub(balance);
+        let mut orders = self.unresolved.clone();
+        orders.sort_by_key(|(sequence, _)| *sequence);
+        let mut resolution = BalanceResolution::default();
+        for (sequence, tokens) in orders {
+            let sold = departed >= tokens;
+            if sold {
+                departed = departed.saturating_sub(tokens);
+                resolution.sold_orders = resolution.sold_orders.saturating_add(1);
+            } else {
+                resolution.unsold_orders = resolution.unsold_orders.saturating_add(1);
+            }
+            self.resolve_unknown(sequence, sold);
+        }
+        resolution.unexplained_tokens = departed;
+        Some(resolution)
     }
 
     /// Issues every order that is due at `elapsed_ms` after genesis.
@@ -913,6 +1011,8 @@ pub struct ExitSummary {
     /// The run ended with orders still unreported (settle timeout, or the
     /// executor went away).
     pub unsettled: bool,
+    /// How the unknown orders were settled from the token account at the end.
+    pub balance: BalanceOutcome,
 }
 
 /// Drives an [`ExitEngine`] from a stream of updates.
@@ -923,6 +1023,7 @@ pub struct ExitManager {
     genesis: Instant,
     settle_timeout: Duration,
     metrics: Option<Arc<PipelineMetrics>>,
+    balance_reader: Option<BalanceReader>,
     /// When the update that has not been acted on yet was received.
     pending_ingest: Option<std::time::Instant>,
 }
@@ -939,6 +1040,7 @@ impl ExitManager {
             genesis,
             settle_timeout: DEFAULT_SETTLE_TIMEOUT,
             metrics: None,
+            balance_reader: None,
             pending_ingest: None,
         }
     }
@@ -951,6 +1053,47 @@ impl ExitManager {
     pub fn with_metrics(mut self, metrics: Arc<PipelineMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Lets the manager settle unknown orders from the token account when the
+    /// run ends (audit finding #45).
+    #[must_use]
+    pub fn with_balance_reader(mut self, reader: BalanceReader) -> Self {
+        self.balance_reader = Some(reader);
+        self
+    }
+
+    /// Reads the token balance and settles the unknown orders, if there are any
+    /// and a reader is configured.
+    async fn settle_unknown(&mut self) -> BalanceOutcome {
+        let Some(reader) = self.balance_reader.clone() else {
+            return BalanceOutcome::NotNeeded;
+        };
+        if self.engine.snapshot().tokens_unresolved == 0 {
+            return BalanceOutcome::NotNeeded;
+        }
+        let balance = match timeout(BALANCE_READ_TIMEOUT, reader.read()).await {
+            Ok(Some(balance)) => balance,
+            Ok(None) | Err(_) => {
+                warn!("unknown orders stay unresolved: the token balance could not be read");
+                return BalanceOutcome::Unavailable;
+            }
+        };
+        match self.engine.resolve_from_balance(balance) {
+            Some(resolution) => {
+                info!(
+                    sold = resolution.sold_orders,
+                    unsold = resolution.unsold_orders,
+                    unexplained = resolution.unexplained_tokens > 0,
+                    "unknown orders settled from the token account"
+                );
+                BalanceOutcome::Resolved(resolution)
+            }
+            None => {
+                warn!("unknown orders stay unresolved: other orders are still unreported");
+                BalanceOutcome::Unavailable
+            }
+        }
     }
 
     /// Overrides how long to wait for reports after the window closes.
@@ -1036,6 +1179,8 @@ impl ExitManager {
             }
         }
 
+        let balance = self.settle_unknown().await;
+
         // Counts and flags only: amounts and balances never reach the logs.
         let snapshot = self.engine.snapshot();
         if snapshot.tokens_unsold > 0
@@ -1058,6 +1203,7 @@ impl ExitManager {
             decode_errors,
             interrupted,
             unsettled,
+            balance,
         })
     }
 

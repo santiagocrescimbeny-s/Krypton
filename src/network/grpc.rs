@@ -12,13 +12,17 @@
 //! it against a real endpoint (curve account, ping, forced drop) before
 //! trusting it with funds.
 //!
-//! It is compiled only with the `grpc` cargo feature, which declares no
-//! dependencies itself so that `Cargo.lock` and the default build (the three
-//! gates) are unaffected. To enable it:
+//! It is compiled only with the `grpc` cargo feature, which ships empty so that
+//! `Cargo.lock` and the default build (the three gates) are unaffected. The
+//! manifest is prepared for it (audit finding #48): placeholders in
+//! `[workspace.dependencies]` and commented lines in `[features]` /
+//! `[dependencies]`. To enable it:
 //!
-//! 1. add to `Cargo.toml` `[dependencies]` (versions sharing one `tonic`):
-//!    `yellowstone-grpc-proto` (with the feature exposing `geyser::geyser_client`),
-//!    `tonic` (with TLS roots, for example `tls-native-roots`) and `tokio-stream`;
+//! 1. in `Cargo.toml`, pin the three placeholders (`yellowstone-grpc-proto` with
+//!    the feature exposing `geyser::geyser_client`, `tonic` with TLS roots, for
+//!    example `tls-native-roots`, and `tokio-stream`; versions sharing one
+//!    `tonic`), uncomment the three `optional = true` dependencies and set
+//!    `grpc = ["dep:yellowstone-grpc-proto", "dep:tonic", "dep:tokio-stream"]`;
 //! 2. run `cargo update -w`, review and commit the `Cargo.lock` diff, run
 //!    `cargo audit`;
 //! 3. build with `--features grpc`.

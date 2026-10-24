@@ -254,17 +254,51 @@ async fn dry_run_assembles_and_signs_but_never_sends() -> TestResult {
 }
 
 #[tokio::test]
-async fn failed_and_invalid_bundles_are_reported_as_failed() -> TestResult {
-    for status in ["Failed", "Invalid"] {
-        let server = scripted(vec![status_reply(status, Value::Null)])?;
-        let fixture = fixture(&server, false, 5)?;
-        assert_eq!(
-            fixture.submitter.submit(&order()?).await?,
-            SellOutcome::Failed
-        );
-        // Decided on the first status check: no more polling.
-        assert_eq!(server.request_count(), 2, "{status}");
-    }
+async fn failed_bundles_are_reported_as_failed_at_the_first_check() -> TestResult {
+    let server = scripted(vec![status_reply("Failed", Value::Null)])?;
+    let fixture = fixture(&server, false, 5)?;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Failed
+    );
+    // Decided on the first status check: no more polling.
+    assert_eq!(server.request_count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_bundles_are_retried_softly_before_they_are_reported_as_failed() -> TestResult {
+    // Audit #37: the first three `Invalid` answers may only mean "not indexed
+    // yet"; the fourth one is final. 1 sendBundle + 4 status checks.
+    let server = scripted(vec![status_reply("Invalid", Value::Null)])?;
+    let fixture = fixture(&server, false, 8)?;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Failed
+    );
+    assert_eq!(server.request_count(), 1 + 4);
+
+    // An `Invalid` that resolves into a landing is a landing.
+    let server = scripted(vec![
+        status_reply("Invalid", Value::Null),
+        status_reply("Invalid", Value::Null),
+        status_reply("Landed", json!(280_999_050u64)),
+    ])?;
+    let fixture = fixture(&server, false, 8)?;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Landed { slot: 280_999_050 }
+    );
+    assert_eq!(server.request_count(), 1 + 3);
+
+    // A polling budget that ends inside the soft window is unknown, not failed.
+    let server = scripted(vec![status_reply("Invalid", Value::Null)])?;
+    let fixture = fixture(&server, false, 3)?;
+    assert_eq!(
+        fixture.submitter.submit(&order()?).await?,
+        SellOutcome::Unknown
+    );
+    assert_eq!(server.request_count(), 1 + 3);
     Ok(())
 }
 

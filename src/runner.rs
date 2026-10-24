@@ -16,9 +16,18 @@
 //! YellowstoneTransport<Link> --> GeyserMonitor --> ExitManager --> order executor --> Jito
 //! ```
 //!
+//! # Order of operations (audit findings #44 and #46)
+//! 1. `started = Instant::now()` and the pure configuration checks;
+//! 2. **live only: [`LiveExecutor::arm`]**, the whole barrier, the keypair file
+//!    and the persisted spending state, *before* any connection exists and
+//!    before any task is spawned, so a refusal leaves no trace on the network;
+//! 3. the first blockhash, the background services, the stream, the exit.
+//!
 //! # Policy choices (for the owner to review)
-//! - `genesis`, the zero of the 1 s to 10 s tranche window, is the moment the
-//!   stream is about to start: the launch is not driven from here.
+//! - `genesis`, the zero of the 1 s to 10 s tranche window, is `started` moved
+//!   back by `--elapsed-ms` (the time the coin has already been live): the
+//!   launch is not driven from here, so the operator says how old it is. With
+//!   the default of 0 the window starts when the session does.
 //! - The cost budget per order assumes the **maximum** tip
 //!   (`MAX_JITO_TIP_LAMPORTS`), the worst case the dynamic tip can reach.
 //! - Dry mode pays the static `JITO_TIP_LAMPORTS` and does not poll the tip feed.
@@ -28,6 +37,8 @@
 //! Static labels and counters only (see [`crate::app`]).
 
 use std::sync::Arc;
+
+use solana_pubkey::Pubkey;
 
 use tokio::time::{timeout, Instant};
 use tracing::{info, warn};
@@ -39,16 +50,19 @@ use crate::app::{
 };
 use crate::builder::sell::{SellBuilder, SellSettings};
 use crate::config::Config;
-use crate::errors::{BridgeError, LauncherError};
+use crate::errors::{BridgeError, LauncherError, LiveError};
+use crate::execution::guards::SECONDS_PER_DAY;
 use crate::execution::live::{
-    run_exit_pipeline, ExitPipeline, ExitRun, LiveExecutor, DEFAULT_DRAIN_TIMEOUT,
+    run_exit_pipeline, unix_now, ExitPipeline, ExitRun, LiveExecutor, DEFAULT_DRAIN_TIMEOUT,
 };
+use crate::execution::persist;
 use crate::execution::tip_feed::TipFeedSettings;
 use crate::execution::tip_http::HttpTipSource;
+use crate::monitor::exit::BalanceReader;
 use crate::monitor::geyser::MonitorSettings;
 use crate::monitor::submit::{blockhash_channel, JitoSellSubmitter};
 use crate::monitor::ShutdownSignal;
-use crate::network::rpc::RpcBlockhashSource;
+use crate::network::rpc::{RpcBlockhashSource, RpcClient};
 use crate::network::yellowstone::YellowstoneTransport;
 use crate::network::{tip_account_for, JitoClient, JitoTip};
 
@@ -116,6 +130,37 @@ pub fn check(config: &Config, request: &LiveRequest) -> Result<CheckReport, Laun
     })
 }
 
+/// Creates the persisted spending-state file (`krypton init-state`), holding an
+/// empty current day. Run it once, on purpose, before the first live session.
+///
+/// It never overwrites: if the file exists (for example after a halt), deleting
+/// it is the operator's deliberate act, and doing so forgets the day's spend.
+///
+/// # Errors
+/// [`LiveError::GuardStatePathMissing`] without `GUARD_STATE_PATH`;
+/// [`LiveError::GuardState`] when the file exists or cannot be written.
+pub fn init_state(config: &Config) -> Result<(), LauncherError> {
+    let path = config
+        .live
+        .guard_state_path
+        .as_deref()
+        .ok_or(LiveError::GuardStatePathMissing)?;
+    let today = unix_now()?.checked_div(SECONDS_PER_DAY).unwrap_or(0);
+    persist::init_state(path, today).map_err(LiveError::from)?;
+    Ok(())
+}
+
+/// The end-of-run balance reader: `getTokenAccountBalance` at `confirmed` for
+/// `account`, with the RPC URL of the configuration. Any failure reads as
+/// "unknown" (`None`), never as zero.
+fn token_balance_reader(config: &Config, account: Pubkey) -> Result<BalanceReader, LauncherError> {
+    let client = Arc::new(RpcClient::new(&config.rpc_url)?);
+    Ok(BalanceReader::new(move || {
+        let client = Arc::clone(&client);
+        async move { client.token_balance(&account).await.ok() }
+    }))
+}
+
 async fn first_blockhash(
     source: &mut RpcBlockhashSource,
 ) -> Result<solana_sdk::hash::Hash, BridgeError> {
@@ -139,11 +184,19 @@ pub async fn run_exit_command(
     mode: Mode,
     shutdown: ShutdownSignal,
 ) -> Result<SessionSummary, LauncherError> {
+    // The window's clock starts here, before anything slow (audit #44).
+    let started = Instant::now();
     let settings = config
         .production
         .yellowstone
         .take()
         .ok_or(BridgeError::YellowstoneNotConfigured)?;
+    // Audit #46: the barrier is crossed before any network I/O or task. A live
+    // session that cannot arm leaves nothing behind.
+    let armed = match mode {
+        Mode::Live => Some(LiveExecutor::arm(&config)?),
+        Mode::Dry => None,
+    };
     if !GRPC_COMPILED {
         return Err(BridgeError::GrpcNotCompiled.into());
     }
@@ -174,10 +227,10 @@ pub async fn run_exit_command(
 
     let transport = YellowstoneTransport::new(Link::default(), settings);
     let monitor = MonitorSettings::default();
-    let genesis = Instant::now();
+    let genesis = args.genesis(started);
 
-    let outcome = match mode {
-        Mode::Dry => {
+    let outcome = match armed {
+        None => {
             // Always a dry client, whatever DRY_RUN says: only `--live` crosses.
             let client = JitoClient::new(&config.jito_engine_url, true)?;
             let tip = JitoTip::from_config(&config, tip_account_for(&args.mint))?;
@@ -198,14 +251,14 @@ pub async fn run_exit_command(
                     genesis,
                     monitor,
                     drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+                    balance: None,
                 },
                 None,
                 shutdown,
             )
             .await
         }
-        Mode::Live => {
-            let executor = LiveExecutor::arm(&config)?;
+        Some(executor) => {
             let source = match &config.production.tip_feed_url {
                 Some(url) => HttpTipSource::new(url)?,
                 None => {
@@ -218,7 +271,11 @@ pub async fn run_exit_command(
                 book: Arc::clone(executor.tips()),
                 settings: TipFeedSettings::default(),
             });
-            executor
+            // Audit #45: unknown outcomes are settled from the confirmed
+            // balance of our own token account when the run ends.
+            let balance = token_balance_reader(&config, builder.addresses().associated_user)?;
+            let guards = Arc::clone(executor.guards());
+            let outcome = executor
                 .run_exit(
                     transport,
                     ExitRun {
@@ -229,10 +286,19 @@ pub async fn run_exit_command(
                         blockhash: hash_receiver,
                         monitor,
                         drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+                        balance: Some(balance),
                     },
                     shutdown,
                 )
+                .await;
+            // The books must be on disk before the process can end (audit #35).
+            let flushed = tokio::task::spawn_blocking(move || guards.flush_persistence())
                 .await
+                .unwrap_or(false);
+            if !flushed {
+                warn!("the spending state could not be written: check GUARD_STATE_PATH");
+            }
+            outcome
         }
     };
 

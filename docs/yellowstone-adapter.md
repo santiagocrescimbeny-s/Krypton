@@ -148,12 +148,21 @@ whether a token is set; providers often put an access token in the URL path, so 
 `src/network/grpc.rs` (`TonicLink`, `subscribe_request`, `convert_update`) implements the
 checklist above. It was written from this document **without ever being compiled**
 (crates.io was unreachable), so expect to fix small API differences the first time. The
-`grpc` feature in `Cargo.toml` declares no dependencies, which keeps `Cargo.lock` and the
-default build (the three gates) untouched. On a machine that reaches crates.io:
+`grpc` feature in `Cargo.toml` ships empty (`grpc = []`), which keeps `Cargo.lock` and the
+default build (the three gates) untouched. Cargo cannot declare an *optional* dependency without
+a lock entry, so the manifest is prepared instead (audit finding #48): the three crates are
+declared as placeholders (`version = "*"`) in `[workspace.dependencies]`, which Cargo does not
+resolve until a package uses them, and the exact lines to switch on are commented in
+`[features]` and `[dependencies]`. `tests/manifest_tests.rs` fails on any half-done state, and CI
+runs the three gates with `--features grpc` as soon as the dependencies are declared. On a
+machine that reaches crates.io:
 
-1. `cargo add yellowstone-grpc-proto tonic tokio-stream` (pick versions that share one
-   `tonic`; give `tonic` a TLS-roots feature such as `tls-native-roots`, and
-   `yellowstone-grpc-proto` the feature that exposes `geyser::geyser_client`);
+1. in `Cargo.toml`: (a) pin `yellowstone-grpc-proto`, `tonic` and `tokio-stream` in
+   `[workspace.dependencies]` (versions that share one `tonic`; give `tonic` a TLS-roots feature
+   such as `tls-native-roots`, and `yellowstone-grpc-proto` the feature that exposes
+   `geyser::geyser_client`); (b) uncomment the three `optional = true` lines in
+   `[dependencies]`; (c) replace `grpc = []` with
+   `grpc = ["dep:yellowstone-grpc-proto", "dep:tonic", "dep:tokio-stream"]`;
 2. `cargo update -w`, review and commit the `Cargo.lock` diff, run `cargo audit`;
 3. `cargo check --all-targets --locked --features grpc`, then the clippy and test gates with
    `--features grpc`. Typical fixes: the TLS-roots call in `TonicLink::open`, field names of

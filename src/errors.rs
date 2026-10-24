@@ -944,6 +944,64 @@ pub enum GuardError {
     /// The guard state was poisoned by a panicking task.
     #[error("the spending guard state is unavailable")]
     StatePoisoned,
+
+    /// The persisted accounting cannot be kept up to date (the state file
+    /// cannot be written). New entries are refused until a write succeeds;
+    /// exits are never blocked.
+    #[error("new entries are refused: the spending state cannot be persisted")]
+    PersistenceFailed,
+
+    /// The persisted accounting belongs to a day that has not happened yet: the
+    /// system clock went backwards, or the file is not ours.
+    #[error("the persisted spending state is dated in the future")]
+    PersistedStateInFuture,
+}
+
+/// Failures of the persisted spending-guard state file (audit finding #35).
+///
+/// Static labels only: the path and the contents are never echoed.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StateFileError {
+    /// The state file does not exist. Create it once, on purpose, with
+    /// `krypton init-state`.
+    #[error("the guard state file does not exist (run `krypton init-state` once)")]
+    Missing,
+
+    /// The state file exists and must not be overwritten by `init-state`.
+    #[error("the guard state file already exists")]
+    AlreadyExists,
+
+    /// Another process holds the state file (a live session, or `check`).
+    #[error("the guard state file is in use by another process")]
+    Locked,
+
+    /// The file could not be read.
+    #[error("the guard state file cannot be read ({reason})")]
+    Unreadable {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The file has unsafe permissions or is not a regular file.
+    #[error("the guard state file is not safe to trust ({reason})")]
+    Insecure {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The contents are not a valid, intact state record.
+    #[error("the guard state file is corrupted ({reason})")]
+    Corrupt {
+        /// Static explanation.
+        reason: &'static str,
+    },
+
+    /// The file could not be written atomically.
+    #[error("the guard state file cannot be written ({reason})")]
+    Write {
+        /// Static explanation.
+        reason: &'static str,
+    },
 }
 
 /// Failures of the dry-to-live barrier and of live execution (Phase 7).
@@ -1002,6 +1060,15 @@ pub enum LiveError {
         /// Static explanation.
         reason: &'static str,
     },
+
+    /// `GUARD_STATE_PATH` is not set.
+    #[error("live trading refused: GUARD_STATE_PATH is required")]
+    GuardStatePathMissing,
+
+    /// The persisted spending state is missing, unreadable, insecure, corrupted
+    /// or in the future. Live trading never starts from a state it cannot trust.
+    #[error("live trading refused: {0}")]
+    GuardState(#[from] StateFileError),
 
     /// A shared live structure was poisoned by a panicking task.
     #[error("live execution state is unavailable")]

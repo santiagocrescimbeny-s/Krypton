@@ -25,6 +25,14 @@
 //! pay the tip and priority fee of a duplicate sell. [`SellOutcome::Failed`] is
 //! reserved for bundles that the Block Engine reported failed or invalid.
 //!
+//! # `Invalid` is not final at first (audit finding #37)
+//! The Block Engine answers `Invalid` for a bundle id it cannot find, which is
+//! also what a bundle that was just accepted looks like while the status API
+//! catches up. [`is_definite_failure`] therefore treats `Invalid` as `Pending`
+//! for the first [`INVALID_SOFT_RETRIES`] status checks and as a failure only
+//! afterwards; `Failed` is final at once. A bundle that never settles inside the
+//! polling budget is [`SellOutcome::Unknown`], as before.
+//!
 //! The public Block Engine allows about one request per second: keep
 //! `poll_interval` at one second or more when using it.
 
@@ -66,6 +74,23 @@ pub fn blockhash_channel(
     watch::Receiver<TimedBlockhash>,
 ) {
     watch::channel(stamp_blockhash(initial))
+}
+
+/// Status checks (counted from zero) at which `Invalid` is still ignored.
+pub const INVALID_SOFT_RETRIES: u32 = 3;
+
+/// Whether `status`, seen at the zero-based status check `attempt`, settles the
+/// bundle as definitely not landed.
+///
+/// `Failed` always does. `Invalid` does only from the check numbered
+/// [`INVALID_SOFT_RETRIES`] on: before that the id may simply not be indexed yet.
+#[must_use]
+pub fn is_definite_failure(status: &InflightStatus, attempt: u32) -> bool {
+    match status {
+        InflightStatus::Failed => true,
+        InflightStatus::Invalid => attempt >= INVALID_SOFT_RETRIES,
+        _ => false,
+    }
 }
 
 /// Default pause between bundle status checks.
@@ -189,10 +214,11 @@ impl SellSubmitter for JitoSellSubmitter {
             }
             match self.client.inflight_status(&bundle_id).await {
                 Ok(InflightStatus::Landed { slot }) => return Ok(SellOutcome::Landed { slot }),
-                Ok(InflightStatus::Failed | InflightStatus::Invalid) => {
+                Ok(status) if is_definite_failure(&status, attempt) => {
                     return Ok(SellOutcome::Failed)
                 }
-                Ok(InflightStatus::Pending | InflightStatus::NotFound) => {}
+                // Pending, not found, or an `Invalid` still within its soft retries.
+                Ok(_) => {}
                 Err(error) if error.is_retryable() => {
                     debug!(sequence = order.sequence, %error, "status check failed; retrying");
                 }

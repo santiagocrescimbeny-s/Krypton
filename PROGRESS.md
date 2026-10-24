@@ -1,6 +1,6 @@
 # PROGRESS — Krypton (Solana Atomic Launcher & Liquidity Engine)
 
-Última actualización: 2026-10-24 · `main` = Fases 1-8 (núcleo) + parches de auditoría #29/#30/#31 + puente de producción (fusionado desde `mainnet-production-bridge`, `a20d423`), verificados con `cargo` real (577 tests en Windows, 581 esperados en Linux) · Pendiente del enlace `tonic` (feature `grpc`, sin compilar) y de la prueba contra un endpoint real
+Última actualización: 2026-10-24 · **rama `audit-fixes-2026-10-24`: parches de auditoría #35, #37, #44, #45, #46, #47 y #48 EN IMPLEMENTACIÓN (pendiente de verificar con `cargo` real, ver «Parches de la auditoría 2026-10-24»)** · `main` = Fases 1-8 (núcleo) + parches #29/#30/#31 + puente de producción (`8ffce9d`), verificados con `cargo` real (577 tests en Windows, 581 esperados en Linux) · Pendiente del enlace `tonic` (feature `grpc`, sin compilar) y de la prueba contra un endpoint real
 
 ## Hoja de ruta
 
@@ -437,6 +437,45 @@ Tests nuevos: 5 en `phase2_tests.rs`, 1 en `phase1_tests.rs`, 6 en `tests/env_hy
 
 `Cargo.lock` se editó a mano para añadir `bytes` (ya estaba en el grafo vía `reqwest`); la auditoría confirmó que
 `--locked` lo acepta.
+
+## Parches de la auditoría 2026-10-24 (rama `audit-fixes-2026-10-24`, EN IMPLEMENTACIÓN)
+
+Detalle en `claude/audit-2026-10-24.md`. Estado: **código y tests escritos; verificación solo en el arnés offline** (ver la tabla de abajo).
+Nada se ha fusionado en `main`.
+
+| # | Hallazgo | Implementación |
+|---|----------|----------------|
+| 35 | Las guardas de gasto vivían solo en memoria: un reinicio regalaba un día nuevo y borraba el *halt* | `src/execution/persist.rs` (registro `krypton-guards-v1` con *checksum*, escritura atómica `0600` + `fsync` + `rename`, hilo escritor en segundo plano, candado exclusivo `<archivo>.lock`); `gate::open_guards`; `LiveExecutor::arm` **falla cerrado** si `GUARD_STATE_PATH` falta, el archivo no existe, es ilegible, está corrupto, tiene permisos abiertos, es un enlace simbólico, tiene fecha futura o está bloqueado. `krypton init-state` lo crea una sola vez (nunca sobrescribe). Si el disco falla, las entradas se rechazan (`PersistenceFailed`) y las salidas nunca se bloquean |
+| 37 | `Invalid` del Block Engine se trataba como fallo definitivo | `monitor::submit::is_definite_failure`: `Failed` siempre final; `Invalid` solo es final a partir del 3.er intento (`INVALID_SOFT_RETRIES = 3`); usado por `poll_bundle` (vivo) y `submit.rs` |
+| 44 | La ventana de salida se anclaba al arranque del comando, no al nacimiento del coin | `exit --elapsed-ms <MS>` (máx. 3 600 000): `genesis = Instant::now() - elapsed` (`ExitArgs::genesis`) |
+| 45 | Órdenes `Unknown` sin resolver al terminar | `RpcClient::token_balance(ata)` (`getTokenAccountBalance`, `confirmed`) + `ExitEngine::resolve_from_balance`; `ExitManager::with_balance_reader` lo ejecuta al final si `tokens_unresolved > 0` (timeout 8 s); `BalanceOutcome` en el resumen; un faltante inexplicado o una orden no vendida marca `needs_attention` (código de salida 3) |
+| 46 | `arm` podía ocurrir después de E/S de red | `run_exit_command`: `LiveExecutor::arm` es lo primero (antes de la comprobación `grpc`, del cliente RPC y de lanzar servicios); test con un `TcpListener` que comprueba que no hay conexión |
+| 47 | `RPC_URL`/`JITO_ENGINE_URL` aceptaban `http://` | `config::parse_url_secure` + `RpcClient::new`: `https://` obligatorio; `http://` solo a `localhost`, `127.0.0.1`, `[::1]`; el error nombra la variable, nunca la URL |
+| 48 | Declarar las dependencias gRPC cambiaría `Cargo.lock` | Una dependencia `optional = true` real **exige** entradas en `Cargo.lock` (no se puede declarar «limpia» sin red). Se deja el manifiesto preparado: marcadores en `[workspace.dependencies]` (no se resuelven mientras ningún paquete los use), plantilla comentada de 3 ediciones en `[features]`/`[dependencies]`, `tests/manifest_tests.rs` que falla en cualquier estado a medias, y un paso de CI que ejecuta los gates con `--features grpc` en cuanto existan. `Cargo.lock` intacto |
+
+Configuración nueva: `GUARD_STATE_PATH` (obligatoria solo para armar el modo vivo; `PRODUCTION_ENV_KEYS` pasa de 5 a 6, `ENV_KEYS` sigue en 21).
+Orden de despliegue: `krypton init-state` una vez, luego `check --live`.
+
+### Verificación
+
+| Gate | Resultado |
+|------|-----------|
+| Arnés offline (sin crates.io; tokio/bytes/thiserror/tracing reales, solana/zeroize/reqwest/serde_json simulados) — `clippy -D warnings` | limpio |
+| Arnés offline — `cargo test` | 6 unitarios + 34 `audit_tests` + 48 `bridge` + 116 `phase5` + 48 `phase6` + 68 `phase7` + 51 `phase8`: **todos pasan** |
+| `rustfmt --check` en los `.rs` modificados | OK |
+| `unwrap`/`expect`/`panic!`/`todo!`/`unsafe`/indexación sin comprobar en `src/` | 0 |
+| `tests/manifest_tests.rs` (6) | verificado con `rustc` simple |
+| **`cargo check/clippy/test --locked` con las crates reales y rustc 1.97.1** | **NO ejecutado** — pendiente del propietario |
+
+No verificados por el arnés (sustituidos por *stubs* o dependientes de serde/reqwest reales): `src/config.rs`, `src/network/rpc.rs`
+(`RpcClient`, `parse_token_balance_response`), `src/storage/metadata.rs`, `src/network/grpc.rs`, `tests/bridge_config_tests.rs`,
+`tests/phase5_submit_tests.rs`. Son los primeros sospechosos si algún gate falla.
+
+Supuestos y deuda conocida:
+- #45 asume que la posición inicial es `--tokens`; si el saldo es mayor de lo esperado se trata como «no vendido».
+- Las reservas en vuelo (`reserved`) no se persisten: tras una caída, conciliar a mano las órdenes en curso.
+- Los reintentos suaves de `Invalid` añaden latencia (hasta 3 sondeos) a una orden realmente inválida.
+- Abiertos de esta auditoría y no incluidos aquí: #36, #38(b), #39/#21/#22, #40, #42.
 
 ## Hallazgos de auditoría abiertos
 

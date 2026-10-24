@@ -707,12 +707,7 @@ fn config_error(name: &'static str, err: &IpfsError) -> ConfigError {
 }
 
 pub(crate) fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    bare.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    crate::parsing::is_loopback_host(host)
 }
 
 /// Parses an endpoint base URL. `allow_loopback_http` lets local mock servers

@@ -9,6 +9,30 @@ pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 /// Number of decimal places in a SOL amount (1 lamport = 1e-9 SOL).
 const SOL_DECIMALS: usize = 9;
 
+/// Whether `host` (as `Url::host_str` renders it, so IPv6 keeps its brackets)
+/// is this machine: `localhost`, or any loopback IP address.
+#[must_use]
+pub fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The endpoint transport policy (audit finding #47): `https` anywhere,
+/// plain `http` only towards a loopback host (local mocks and tunnels). Any
+/// other scheme is refused.
+#[must_use]
+pub fn endpoint_scheme_allowed(scheme: &str, host: &str) -> bool {
+    match scheme {
+        "https" => true,
+        "http" => is_loopback_host(host),
+        _ => false,
+    }
+}
+
 fn is_ascii_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }

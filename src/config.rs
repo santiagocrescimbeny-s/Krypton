@@ -34,10 +34,10 @@ use solana_commitment_config::CommitmentConfig;
 
 use crate::errors::{ConfigError, WalletError};
 use crate::execution::settings::{
-    LiveSettings, RawLiveSettings, ENV_DAILY_DRAWDOWN_SOL, ENV_LIVE_CONFIRM, ENV_LIVE_KEYPAIR_PATH,
-    ENV_LIVE_TRADING, ENV_MAX_SOL_PER_TX,
+    LiveSettings, RawLiveSettings, ENV_DAILY_DRAWDOWN_SOL, ENV_GUARD_STATE_PATH, ENV_LIVE_CONFIRM,
+    ENV_LIVE_KEYPAIR_PATH, ENV_LIVE_TRADING, ENV_MAX_SOL_PER_TX,
 };
-use crate::parsing::{parse_bool, parse_sol_to_lamports};
+use crate::parsing::{endpoint_scheme_allowed, parse_bool, parse_sol_to_lamports};
 use crate::production::{
     merge_alias, ProductionSettings, RawProductionSettings, ENV_JITO_BLOCK_ENGINE_URL,
     ENV_JITO_TIP_STREAM_URL, ENV_PAYER_KEYPAIR_PATH, ENV_YELLOWSTONE_ENDPOINT,
@@ -111,13 +111,15 @@ pub const ENV_KEYS: [&str; 21] = [
 
 /// The production-bridge variables (see [`crate::production`]): all optional.
 /// `PAYER_KEYPAIR_PATH` and `JITO_BLOCK_ENGINE_URL` are aliases of
-/// `LIVE_KEYPAIR_PATH` and `JITO_ENGINE_URL`.
-pub const PRODUCTION_ENV_KEYS: [&str; 5] = [
+/// `LIVE_KEYPAIR_PATH` and `JITO_ENGINE_URL`. `GUARD_STATE_PATH` (audit
+/// finding #35) locates the persisted spending state.
+pub const PRODUCTION_ENV_KEYS: [&str; 6] = [
     ENV_YELLOWSTONE_ENDPOINT,
     ENV_YELLOWSTONE_X_TOKEN,
     ENV_JITO_BLOCK_ENGINE_URL,
     ENV_JITO_TIP_STREAM_URL,
     ENV_PAYER_KEYPAIR_PATH,
+    ENV_GUARD_STATE_PATH,
 ];
 
 // --- Defaults and limits -------------------------------------------------------
@@ -192,6 +194,7 @@ struct RawConfig {
     jito_block_engine_url: Option<String>,
     jito_tip_stream_url: Option<String>,
     payer_keypair_path: Option<String>,
+    guard_state_path: Option<String>,
 }
 
 // --- Validated configuration ---------------------------------------------------
@@ -456,6 +459,7 @@ impl Config {
                 raw.live_keypair_path,
                 raw.payer_keypair_path,
             )?,
+            guard_state_path: raw.guard_state_path,
             max_sol_per_tx: raw.max_sol_per_tx,
             daily_drawdown_sol: raw.daily_drawdown_sol,
         })?;
@@ -466,11 +470,11 @@ impl Config {
         })?;
 
         Ok(Self {
-            rpc_url: parse_url(ENV_RPC_URL, &rpc_url, &["http", "https"])?,
+            rpc_url: parse_url_secure(ENV_RPC_URL, &rpc_url)?,
             rpc_ws_url: clean(raw.rpc_ws_url)
                 .map(|text| parse_url(ENV_RPC_WS_URL, &text, &["ws", "wss"]))
                 .transpose()?,
-            jito_engine_url: parse_url(ENV_JITO_ENGINE_URL, &jito_engine_url, &["http", "https"])?,
+            jito_engine_url: parse_url_secure(ENV_JITO_ENGINE_URL, &jito_engine_url)?,
             commitment,
             preflight_commitment,
             creator_buy_lamports,
@@ -647,6 +651,21 @@ fn parse_url(name: &'static str, text: &str, schemes: &[&str]) -> Result<Url, Co
     }
     if url.host_str().is_none() {
         return Err(invalid(name, "URL must include a host"));
+    }
+    Ok(url)
+}
+
+/// [`parse_url`] for the endpoints that carry orders and API keys
+/// (`RPC_URL`, `JITO_ENGINE_URL`): `https`, or plain `http` towards a loopback
+/// host only (audit finding #47). The error names the variable, never the URL.
+fn parse_url_secure(name: &'static str, text: &str) -> Result<Url, ConfigError> {
+    let url = parse_url(name, text, &["http", "https"])?;
+    let host = url.host_str().unwrap_or_default();
+    if !endpoint_scheme_allowed(url.scheme(), host) {
+        return Err(invalid(
+            name,
+            "must use https (plain http is only allowed for localhost, 127.0.0.1 or [::1])",
+        ));
     }
     Ok(url)
 }
