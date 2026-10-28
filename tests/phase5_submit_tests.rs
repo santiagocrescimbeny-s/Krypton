@@ -271,9 +271,9 @@ async fn invalid_bundles_are_retried_softly_before_they_are_reported_as_failed()
     // Audit #37: the first three `Invalid` answers may only mean "not indexed
     // yet"; the fourth one is final. 1 sendBundle + 4 status checks.
     let server = scripted(vec![status_reply("Invalid", Value::Null)])?;
-    let fixture = fixture(&server, false, 8)?;
+    let exhausted = fixture(&server, false, 8)?;
     assert_eq!(
-        fixture.submitter.submit(&order()?).await?,
+        exhausted.submitter.submit(&order()?).await?,
         SellOutcome::Failed
     );
     assert_eq!(server.request_count(), 1 + 4);
@@ -284,18 +284,18 @@ async fn invalid_bundles_are_retried_softly_before_they_are_reported_as_failed()
         status_reply("Invalid", Value::Null),
         status_reply("Landed", json!(280_999_050u64)),
     ])?;
-    let fixture = fixture(&server, false, 8)?;
+    let recovered = fixture(&server, false, 8)?;
     assert_eq!(
-        fixture.submitter.submit(&order()?).await?,
+        recovered.submitter.submit(&order()?).await?,
         SellOutcome::Landed { slot: 280_999_050 }
     );
     assert_eq!(server.request_count(), 1 + 3);
 
     // A polling budget that ends inside the soft window is unknown, not failed.
     let server = scripted(vec![status_reply("Invalid", Value::Null)])?;
-    let fixture = fixture(&server, false, 3)?;
+    let short_budget = fixture(&server, false, 3)?;
     assert_eq!(
-        fixture.submitter.submit(&order()?).await?,
+        short_budget.submitter.submit(&order()?).await?,
         SellOutcome::Unknown
     );
     assert_eq!(server.request_count(), 1 + 3);
